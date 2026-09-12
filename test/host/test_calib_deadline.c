@@ -9,9 +9,18 @@
  * that is supposed to use the primitive. I "validated" that test by sabotaging the primitive --
  * which the test called directly -- so of course it failed. Wrong experiment, confident result.
  *
- * Here the only deadline logic is production's. The stubs below know nothing about deadlines;
- * they just burn virtual time and fail, the way a wedged bus does. If someone removes the
- * enforcement from calib_execute_command(), THIS test fails.
+ * If someone removes the enforcement from calib_execute_command(), THIS test fails -- verified by
+ * doing exactly that: the bound degrades from 2500 ms to 4978 ms and the timing assertion trips.
+ *
+ * BE PRECISE ABOUT THE STUBS. They do NOT "know nothing about deadlines" -- an earlier version of
+ * this comment said so and it was wrong. They deliberately MIRROR the real HAL: refuse to start
+ * outside budget, clamp the transfer to what remains. That is why two assertions survive the
+ * sabotage above; loop-level enforcement is not the only thing holding the line, and the timing
+ * assertion is what catches its removal.
+ *
+ * AND WHAT THIS DOES NOT ESTABLISH: a hard on-device bound. The transport here is modeled, not
+ * the ESP32 HAL, so this proves the command layer enforces the budget against a transport that
+ * behaves as specified. Real driver and scheduling overhead are not measured.
  */
 #include "cryptoauthlib.h"
 #include "calib/calib_execution.h"
