@@ -477,6 +477,15 @@ ATCA_STATUS hal_i2c_init(ATCAIface iface, ATCAIfaceCfg *cfg)
 
             rc = i2c_new_master_bus(&bus_config, &i2c_hal_data[bus].bus_handle);
             if (rc != ESP_OK) {
+                /* ROLL BACK. ref_ct was claimed at the top of this branch, before any of the
+                 * work that can fail. Returning without releasing it leaves the slot looking
+                 * OWNED with nothing behind it, and every later init then takes the reuse
+                 * branch below -- which, before this change, always reported failure. The
+                 * boot retry loop in main.cpp is the visible victim: after one genuine
+                 * failure it cannot succeed, so the retries are decorative. */
+                i2c_hal_data[bus].bus_handle = NULL;
+                i2c_hal_data[bus].initialized = false;
+                i2c_hal_data[bus].ref_ct = 0;
                 return ATCA_COMM_FAIL;
             }
 
@@ -503,6 +512,10 @@ ATCA_STATUS hal_i2c_init(ATCAIface iface, ATCAIfaceCfg *cfg)
             rc = i2c_master_bus_add_device(i2c_hal_data[bus].bus_handle, &dev_cfg, &i2c_hal_data[bus].dev_handle);
             if (rc != ESP_OK) {
                 i2c_del_master_bus(i2c_hal_data[bus].bus_handle);
+                i2c_hal_data[bus].bus_handle = NULL;      /* deleted -- do not leave it dangling */
+                i2c_hal_data[bus].dev_handle = NULL;
+                i2c_hal_data[bus].initialized = false;
+                i2c_hal_data[bus].ref_ct = 0;             /* see the rollback note above */
                 return ATCA_COMM_FAIL;
             }
 
@@ -522,12 +535,35 @@ ATCA_STATUS hal_i2c_init(ATCAIface iface, ATCAIfaceCfg *cfg)
             if (rc != ESP_OK) {
                 i2c_master_bus_rm_device(i2c_hal_data[bus].dev_handle);
                 i2c_del_master_bus(i2c_hal_data[bus].bus_handle);
+                i2c_hal_data[bus].dev_handle = NULL;
+                i2c_hal_data[bus].bus_handle = NULL;
+                i2c_hal_data[bus].wake_handle = NULL;
+                i2c_hal_data[bus].initialized = false;
+                i2c_hal_data[bus].ref_ct = 0;             /* see the rollback note above */
                 return ATCA_COMM_FAIL;
             }
 
             i2c_hal_data[bus].initialized = true;
-        } else {
+        } else if (i2c_hal_data[bus].initialized) {
+            /* A GENUINE REUSE IS A SUCCESS, and this branch used to say otherwise.
+             *
+             * `rc` is seeded ESP_FAIL at the top and was never assigned here, so every
+             * re-entrant init returned ATCA_COMM_FAIL even when the bus was perfectly healthy
+             * and the reference count had just been incremented. The caller then treats a
+             * working chip as a dead one. */
             i2c_hal_data[bus].ref_ct++;
+            rc = ESP_OK;
+        } else {
+            /* ref_ct claimed but never successfully initialised.
+             *
+             * DO NOT "RECOVER" BY RESETTING ref_ct AND RETRYING THE FRESH PATH. That is
+             * precisely the state a CONCURRENTLY INITIALISING task occupies between claiming
+             * the slot and finishing construction, so resetting would delete a bus another
+             * task is still building. Failing loudly is correct; the rollbacks above are what
+             * make this state unreachable in the sequential case. */
+            ESP_LOGE("HAL_I2C", "bus %d: ref_ct=%d but not initialized - refusing to reuse a "
+                                "half-built interface", bus, i2c_hal_data[bus].ref_ct);
+            return ATCA_COMM_FAIL;
         }
 
         iface->hal_data = &i2c_hal_data[bus];
@@ -720,7 +756,24 @@ ATCA_STATUS hal_i2c_release(void *hal_data)
 {
     ATCAI2CMaster_t *hal = (ATCAI2CMaster_t*)hal_data;
 
-    if (hal && --(hal->ref_ct) <= 0) {
+    if (!hal) {
+        return ATCA_SUCCESS;
+    }
+
+    /* CLAMPED. The decrement used to be unconditional, so a release with no matching init drove
+     * ref_ct NEGATIVE -- and `if (0 == ref_ct)` in hal_i2c_init then never matched again, sending
+     * every subsequent init down the reuse branch.
+     *
+     * Unbalanced releases are not hypothetical in this firmware: the app releases deliberately to
+     * hand the chip to esp-tls, the bus-recovery path releases before re-initialising, and
+     * ESP-IDF's esp_mbedtls_cleanup() releases the GLOBAL device on any TLS teardown, including
+     * connections that never touched the ATECC. */
+    if (hal->ref_ct > 0) {
+        hal->ref_ct--;
+    }
+
+    if (hal->ref_ct <= 0) {
+        hal->ref_ct = 0;                 /* never leave it negative */
         if (hal->wake_handle) {
             i2c_master_bus_rm_device(hal->wake_handle);
             hal->wake_handle = NULL;
