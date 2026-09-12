@@ -614,7 +614,16 @@ ATCA_STATUS hal_i2c_send(ATCAIface iface, uint8_t word_address, uint8_t *txdata,
         {.write_buffer = (uint8_t*)txdata, .buffer_size = txlength},
     };
 
-    rc = i2c_master_multi_buffer_transmit(hal_data->dev_handle, buffer_info, 2, 200);
+    /* THIS is the branch a 5.5 build compiles, and the first version of this bound patched only
+     * the 5.2/5.3 branch below -- so the send half was left entirely unbounded on every device we
+     * actually ship. Found by review, not by testing, because nothing exercised it. */
+    if (!atca_deadline_can_start())
+    {
+        ESP_LOGW("HAL_I2C", "send declined: deadline spent");
+        return ATCA_TIMEOUT;
+    }
+    rc = i2c_master_multi_buffer_transmit(hal_data->dev_handle, buffer_info, 2,
+                                          (int)atca_deadline_remaining_ms(200));
 #else
     // For ESP-IDF v5.2 and v5.3, use dynamic allocation for the write buffer
     // Prepare write buffer: word_address + txdata
@@ -638,6 +647,7 @@ ATCA_STATUS hal_i2c_send(ATCAIface iface, uint8_t word_address, uint8_t *txdata,
      * the receive path. Refuse to start outside budget, then clamp what we do start. */
     if (!atca_deadline_can_start())
     {
+        free(write_buffer);   /* the early return added by this bound must not leak it */
         ESP_LOGW("HAL_I2C", "send declined: deadline spent");
         return ATCA_TIMEOUT;
     }
