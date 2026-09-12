@@ -89,35 +89,51 @@ ATCA_STATUS calib_selftest(ATCADevice device, uint8_t mode, uint16_t param2, uin
 
         status = atca_execute_command(packet, device);
 
-        // This command is a little awkward, because it returns its status as
-        // a single byte, which can be hard to differentiate from an actual
-        // error code.
+        /* CHECK THE TRANSACTION BEFORE INTERPRETING ITS BUFFER.
+         *
+         * The original code went straight to packet->data and only consulted `status` inside a
+         * branch that could never be taken:
+         *
+         *     if ((response & (mode == 0u ? 1u : 0u)) != 0u)
+         *
+         * For any NON-ZERO mode -- which includes SELFTEST_MODE_RNG, the one this fleet uses --
+         * the mask is 0, so `response & 0` is always 0 and the error branch is dead. Every
+         * outcome fell through to the else, which returns ATCA_SUCCESS and reports the buffer as
+         * a failure bitmap.
+         *
+         * So a transaction that never completed -- CRC error, short read, and now a deadline
+         * timeout -- read back as "self-test ran, and here is its result", with a zeroed buffer
+         * decoding as result=0, i.e. NOTHING FAILED. A chip that could not be reached reported
+         * itself healthy. That sits directly on the RNG recovery path.
+         *
+         * Transport failures are now returned as themselves. Only a transaction that actually
+         * completed gets its response decoded. */
+        if (ATCA_SUCCESS != status)
+        {
+            calib_packet_free(packet);
+            return status;
+        }
+
+        /* A SelfTest response is one byte; anything shorter is not a response we can read. */
+        if (packet->data[ATCA_COUNT_IDX] < (ATCA_RSP_DATA_IDX + 1u))
+        {
+            calib_packet_free(packet);
+            return ATCA_RX_FAIL;
+        }
 
         response = packet->data[ATCA_RSP_DATA_IDX];
 
-        if ((response & (mode == 0u ? 1u : 0u)) != 0u)
+        /* The remaining ambiguity is real and is the chip's, not ours: for a completed command
+         * some status bytes are indistinguishable from a failure bitmap. We keep the library's
+         * original interpretation -- assume a self-test result -- but only now that the
+         * transaction itself is known to have succeeded. */
+        if (NULL != result)
         {
-            calib_packet_free(packet);
-            // The response has bits set outside of the bit field requested by
-            // the mode. This indicates an actual error rather than a self test
-            // failure.
-            return status;  // Return the translated status.
+            *result = response;
         }
-        else
-        {
-            // Here, we have the possibility of ambiguous results, where some
-            // error codes can't be differentiated from self test failures.
-            // We assume self-test failures.
-            if (NULL != result)
-            {
-                *result = response;
-            }
 
-            calib_packet_free(packet);
-            // Self tests might have failed, but we returned success because
-            // the results are returned in result.
-            return ATCA_SUCCESS;
-        }
+        calib_packet_free(packet);
+        return ATCA_SUCCESS;
     } while (false);
 
     calib_packet_free(packet);

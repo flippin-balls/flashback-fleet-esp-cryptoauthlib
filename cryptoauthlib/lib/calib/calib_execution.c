@@ -549,19 +549,49 @@ ATCA_STATUS calib_execute_command(ATCAPacket* packet, ATCADevice device)
             }
 
         }
+        /* THE WAKE/SEND LADDER CONSUMES THE BUDGET TOO.
+         *
+         * This loop was outside the deadline entirely: with rx_retries at 50 and a wake that can
+         * block in the HAL, a command could spend its whole allowance here and never reach the
+         * response poll where the check used to live. Bounding only the poll loop would have
+         * bounded the half that was already the shorter one. */
         /* coverity[cert_int32_c_violation:FALSE]  No overflow possible */
-        while (0 < retries--);
+        while ((0 < retries--) && !atca_deadline_expired());
+
+        if (atca_deadline_expired() && (ATCA_SUCCESS != status))
+        {
+            /* Report the budget, not the last transport error. The caller needs to know it ran
+             * out of time -- a command that timed out may still have EXECUTED on the chip. */
+            status = ATCA_TIMEOUT;
+        }
 
         if (ATCA_SUCCESS != status)
         {
             break;
         }
 
-        // Delay for execution time or initial wait before polling
-        atca_delay_ms(execution_or_wait_time);
+        /* The execution wait is real time and must come out of the same budget, clamped so it
+         * cannot by itself overshoot. Returns execution_or_wait_time unchanged when no deadline
+         * is set. */
+        atca_delay_ms(atca_deadline_remaining_ms(execution_or_wait_time));
+
+        if (atca_deadline_expired())
+        {
+            status = ATCA_TIMEOUT;
+            break;
+        }
 
         do
         {
+            /* Do not BEGIN a receive that the remaining budget cannot cover -- see
+             * ATCA_DEADLINE_MIN_SLICE_MS. Starting it would overrun the budget and produce a
+             * failure indistinguishable from a real bus fault. */
+            if (!atca_deadline_can_start())
+            {
+                status = ATCA_TIMEOUT;
+                break;
+            }
+
             (void)memset(packet->data, 0, sizeof(packet->data));
             // receive the response
             rxsize = (uint16_t)sizeof(packet->data);
@@ -629,9 +659,28 @@ ATCA_STATUS calib_execute_command(ATCAPacket* packet, ATCADevice device)
     // Skip Idle for ECC204 device
     if (!atcab_is_ca2_device(device->mIface.mIfaceCFG->devtype))
     {
-        (void)calib_idle(device);
-        device->device_state = (uint8_t)ATCA_DEVICE_STATE_IDLE;
+        if (ATCA_TIMEOUT == status)
+        {
+            /* DO NOT idle after the budget blew. calib_idle() is more chip I/O on a bus that has
+             * just proven unresponsive, it is not itself bounded, and its result was being
+             * discarded -- so the old code both overran the deadline it had just enforced and
+             * then asserted a state it had not achieved.
+             *
+             * UNKNOWN is the honest state and the safe one: the next command sees a device that
+             * is not ACTIVE and wakes it properly, instead of trusting an IDLE that was never
+             * confirmed. */
+            device->device_state = (uint8_t)ATCA_DEVICE_STATE_UNKNOWN;
+        }
+        else
+        {
+            (void)calib_idle(device);
+            device->device_state = (uint8_t)ATCA_DEVICE_STATE_IDLE;
+        }
     }
+
+    /* The budget belongs to THIS command. Clearing the expiry stops a later direct wake or idle
+     * -- neither of which comes through here -- from inheriting a spent one. */
+    atca_deadline_end();
 
     return status;
 }

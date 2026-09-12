@@ -633,7 +633,16 @@ ATCA_STATUS hal_i2c_send(ATCAIface iface, uint8_t word_address, uint8_t *txdata,
         memcpy(write_buffer + 1, txdata, txlength);
     }
 
-    rc = i2c_master_transmit(hal_data->dev_handle, write_buffer, write_size, 200);
+    /* The send half was uncapped. With the wake ladder retrying, a command could spend its whole
+     * budget transmitting into a bus that never acknowledges, while the deadline sat waiting in
+     * the receive path. Refuse to start outside budget, then clamp what we do start. */
+    if (!atca_deadline_can_start())
+    {
+        ESP_LOGW("HAL_I2C", "send declined: deadline spent");
+        return ATCA_TIMEOUT;
+    }
+    rc = i2c_master_transmit(hal_data->dev_handle, write_buffer, write_size,
+                             (int)atca_deadline_remaining_ms(200));
     free(write_buffer);
 #endif // ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 4, 0)
 
@@ -669,10 +678,16 @@ ATCA_STATUS hal_i2c_receive(ATCAIface iface, uint8_t address, uint8_t *rxdata, u
         return ATCA_BAD_PARAM;
     }
 
-    /* Never let ONE transfer outlive the command's whole budget. With a 2500 ms deadline and
-     * 200 ms per receive, an unshortened transfer started with 50 ms left would overrun by 150 ms
-     * every iteration. atca_deadline_remaining_ms() returns the cap unchanged when no deadline is
-     * set, so this is exactly the previous behaviour by default. */
+    /* Never let ONE transfer outlive the command's whole budget, and never ARM a timeout too
+     * short to be represented: at CONFIG_FREERTOS_HZ=100 a sub-10 ms timeout rounds toward zero
+     * ticks and can fail a perfectly healthy transfer. Below that floor we decline instead --
+     * reporting the budget honestly rather than manufacturing a bus failure out of it.
+     * Both calls return the cap unchanged when no deadline is set. */
+    if (!atca_deadline_can_start())
+    {
+        ESP_LOGW("HAL_I2C", "receive declined: deadline spent");
+        return ATCA_TIMEOUT;
+    }
     rc = i2c_master_receive(hal_data->dev_handle, rxdata, *rxlength,
                             (int)atca_deadline_remaining_ms(200));
     if (ESP_OK == rc) {
@@ -727,6 +742,14 @@ ATCA_STATUS hal_i2c_wake(ATCAIface iface)
      * Safe: the ATECC owns a dedicated I2C bus (SDA=9/SCL=40) and cryptoauthlib serializes ops
      * under the HAL mutex, so nothing else races in this ~microsecond window. */
     esp_log_level_set("i2c.master", ESP_LOG_NONE);
+    /* Entry-bounded only. The wake pulse is already 10 ms -- exactly one tick at this build's
+     * FREERTOS_HZ -- so shortening it further is not representable. Refuse to start it outside
+     * budget; do not try to trim it. */
+    if (!atca_deadline_can_start())
+    {
+        ESP_LOGW("HAL_I2C", "wake declined: deadline spent");
+        return ATCA_TIMEOUT;
+    }
     rc = i2c_master_transmit(hal_data->wake_handle, &wake_byte, 1, 10 /* ms */);
     esp_log_level_set("i2c.master", ESP_LOG_ERROR);
     (void)rc;  // intentional: NACK is the design
@@ -828,3 +851,11 @@ ATCA_STATUS hal_i2c_control(ATCAIface iface, uint8_t option, void* param, size_t
 }
 
 #endif // ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 2, 0) || defined(CONFIG_ATCA_I2C_USE_LEGACY_DRIVER)
+
+/* The on-target clock for the command deadline. Kept HERE rather than in atca_deadline.c so that
+ * unit stays free of ESP dependencies and can be compiled by a host test. */
+#include "esp_timer.h"
+int64_t atca_deadline_default_clock_us(void)
+{
+    return esp_timer_get_time();
+}
