@@ -584,3 +584,62 @@ ATCA_STATUS hal_custom_control(ATCAIface iface, uint8_t option, void* param, siz
     return status;
 }
 #endif
+
+
+/* ---- PER-COMMAND ELAPSED-TIME DEADLINE ----------------------------------------------------
+ * See atca_hal.h for why this exists and what it does NOT promise.
+ *
+ * File-static rather than per-interface: cryptoauthlib already drives ONE global device, and the
+ * callers that need a deadline are the ones serialised around it. A per-interface budget would
+ * be more precise and is not worth the surface area until a second interface exists.
+ *
+ * esp_timer_get_time() is monotonic from boot and unaffected by NTP or timezone, which matters
+ * because the alternative (a wall clock) can step backwards and silently extend a deadline.
+ */
+#include "esp_timer.h"
+
+static uint32_t s_deadline_budget_ms = 0;   /* 0 = disabled, and disabled is the default */
+static int64_t  s_deadline_expires_us = 0;
+
+void atca_deadline_set_ms(uint32_t ms)
+{
+    s_deadline_budget_ms = ms;
+}
+
+uint32_t atca_deadline_get_ms(void)
+{
+    return s_deadline_budget_ms;
+}
+
+void atca_deadline_begin(void)
+{
+    if (s_deadline_budget_ms == 0u) {
+        s_deadline_expires_us = 0;
+        return;
+    }
+    s_deadline_expires_us = esp_timer_get_time() + ((int64_t)s_deadline_budget_ms * 1000);
+}
+
+bool atca_deadline_expired(void)
+{
+    if (s_deadline_budget_ms == 0u || s_deadline_expires_us == 0) {
+        return false;
+    }
+    return esp_timer_get_time() >= s_deadline_expires_us;
+}
+
+uint32_t atca_deadline_remaining_ms(uint32_t cap)
+{
+    if (s_deadline_budget_ms == 0u || s_deadline_expires_us == 0) {
+        return cap;
+    }
+    int64_t left_us = s_deadline_expires_us - esp_timer_get_time();
+    if (left_us <= 0) {
+        return 1;   /* never 0: a 0 timeout means "wait forever" in some drivers */
+    }
+    uint32_t left_ms = (uint32_t)(left_us / 1000);
+    if (left_ms == 0u) {
+        left_ms = 1u;
+    }
+    return (left_ms < cap) ? left_ms : cap;
+}

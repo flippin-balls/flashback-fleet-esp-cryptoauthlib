@@ -669,7 +669,12 @@ ATCA_STATUS hal_i2c_receive(ATCAIface iface, uint8_t address, uint8_t *rxdata, u
         return ATCA_BAD_PARAM;
     }
 
-    rc = i2c_master_receive(hal_data->dev_handle, rxdata, *rxlength, 200);
+    /* Never let ONE transfer outlive the command's whole budget. With a 2500 ms deadline and
+     * 200 ms per receive, an unshortened transfer started with 50 ms left would overrun by 150 ms
+     * every iteration. atca_deadline_remaining_ms() returns the cap unchanged when no deadline is
+     * set, so this is exactly the previous behaviour by default. */
+    rc = i2c_master_receive(hal_data->dev_handle, rxdata, *rxlength,
+                            (int)atca_deadline_remaining_ms(200));
     if (ESP_OK == rc) {
         status = ATCA_SUCCESS;
     }

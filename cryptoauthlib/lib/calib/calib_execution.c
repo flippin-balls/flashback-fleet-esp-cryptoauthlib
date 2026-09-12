@@ -474,6 +474,11 @@ ATCA_STATUS calib_execute_command(ATCAPacket* packet, ATCADevice device)
     uint8_t device_address = atcab_get_device_address(device);
     int32_t retries;
 
+    /* ONE BUDGET PER COMMAND, captured before any retry. Retries inside this command CONSUME it
+     * rather than each restarting it -- otherwise the wake ladder and the poll loop would each
+     * get a full allowance and the "bound" would be a multiple of itself. No-op when disabled. */
+    atca_deadline_begin();
+
     do
     {
 #ifdef ATCA_NO_POLL
@@ -563,6 +568,22 @@ ATCA_STATUS calib_execute_command(ATCAPacket* packet, ATCADevice device)
 
             if (ATCA_SUCCESS == (status = calib_execute_receive(device, device_address, packet->data, &rxsize)))
             {
+                break;
+            }
+
+            /* WALL-CLOCK TERMINATION, in addition to the iteration count.
+             *
+             * max_delay_count alone bounds how many TIMES we poll, not how LONG. Each
+             * calib_execute_receive() can block in the HAL, so 1251 iterations can span minutes
+             * while every individual limit is honoured. Checking elapsed time here is what makes
+             * the bound real for callers that opt in.
+             *
+             * ATCA_TIMEOUT rather than a receive error: the distinction matters to the caller,
+             * because a command that ran out of time may still have EXECUTED on the chip and
+             * must not be silently replayed. */
+            if (atca_deadline_expired())
+            {
+                status = ATCA_TIMEOUT;
                 break;
             }
 

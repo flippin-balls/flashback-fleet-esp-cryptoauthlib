@@ -283,4 +283,46 @@ uint8_t hal_is_command_word(uint8_t word_address);
 
 /** @} */
 
+/* ---- PER-COMMAND ELAPSED-TIME DEADLINE -----------------------------------------------------
+ *
+ * CryptoAuthLib bounds command polling in ITERATIONS, not in wall clock:
+ * ATCA_POLLING_MAX_TIME_MSEC / ATCA_POLLING_FREQUENCY_TIME_MSEC = 1250, plus the first attempt.
+ * Each of those iterations calls into the HAL receive, which on ESP32 can block up to 200 ms
+ * waiting on a bus that has stopped answering. So a single command can occupy roughly
+ * 1251 x (2 + 200) ms -- about 252 seconds -- while every individual bound is respected.
+ *
+ * That is survivable on a task built to block and fatal anywhere with a deadline, which is why
+ * callers have historically been RELOCATED rather than bounded. This gives them the option to be
+ * bounded instead.
+ *
+ * DEFAULT IS OFF (0), and off means byte-identical behaviour to before. Provisioning and
+ * enrollment can take as long as they need unless someone deliberately opts them in; only the
+ * paths that genuinely cannot afford to block should set a deadline.
+ *
+ * The deadline is ABSOLUTE, captured once when a command begins, so retries inside that command
+ * consume it rather than each restarting it. On expiry the command returns ATCA_TIMEOUT and the
+ * device state is left UNKNOWN: a command that timed out may still have EXECUTED on the chip
+ * (writes, counter increments, key generation), so it must never be silently replayed.
+ *
+ * Not a hard real-time guarantee. ESP-IDF's own transfer timeout covers the bus mutex and
+ * internal waits rather than being an end-to-end cap, so the achievable bound is
+ * "deadline + one bounded driver operation + scheduling tolerance". Do not advertise otherwise.
+ */
+
+/** \brief Set the wall-clock budget for each subsequent ATECC command. 0 disables (default). */
+void atca_deadline_set_ms(uint32_t ms);
+
+/** \brief The configured budget, 0 if disabled. */
+uint32_t atca_deadline_get_ms(void);
+
+/** \brief Begin a command's budget. No-op when disabled. */
+void atca_deadline_begin(void);
+
+/** \brief true once the current command's budget is spent. Always false when disabled. */
+bool atca_deadline_expired(void);
+
+/** \brief Milliseconds left in the current budget, or `cap` when disabled/uncapped.
+ *  Used to shorten an individual transfer so it cannot overrun the budget on its own. */
+uint32_t atca_deadline_remaining_ms(uint32_t cap);
+
 #endif /* ATCA_HAL_H_ */

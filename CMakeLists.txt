@@ -31,7 +31,9 @@ set(COMPONENT_INCLUDEDIRS   "${CRYPTOAUTHLIB_DIR}/"
                             "${COMPONENT_DIR}/cryptoauthlib/third_party/"
 )
 
-set(COMPONENT_REQUIRES      "mbedtls" "freertos"  "driver")
+# esp_timer: atca_hal.c uses esp_timer_get_time() for the per-command elapsed-time deadline.
+# Monotonic from boot, so a wall-clock step cannot silently extend a budget.
+set(COMPONENT_REQUIRES      "mbedtls" "freertos"  "driver" "esp_timer")
 
 # Don't include the default interface configurations from cryptoauthlib
 set(COMPONENT_EXCLUDE_SRCS "${CRYPTOAUTHLIB_DIR}/atca_cfgs.c")
