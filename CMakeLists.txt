@@ -14,7 +14,8 @@ set(COMPONENT_SRCDIRS       "${CRYPTOAUTHLIB_DIR}/atcacert"
                             "port"
                             )
 
-set(COMPONENT_SRCS          "${COMPONENT_DIR}/cryptoauthlib/lib/hal/atca_hal.c"
+set(COMPONENT_SRCS          "${COMPONENT_DIR}/cryptoauthlib/lib/hal/atca_deadline.c"
+                            "${COMPONENT_DIR}/cryptoauthlib/lib/hal/atca_hal.c"
                             "${COMPONENT_DIR}/cryptoauthlib/lib/hal/hal_freertos.c"
                             "${COMPONENT_DIR}/cryptoauthlib/third_party/hal/esp32/hal_esp32_i2c.c"
                             "${COMPONENT_DIR}/cryptoauthlib/third_party/hal/esp32/hal_esp32_timer.c"
@@ -31,7 +32,8 @@ set(COMPONENT_INCLUDEDIRS   "${CRYPTOAUTHLIB_DIR}/"
                             "${COMPONENT_DIR}/cryptoauthlib/third_party/"
 )
 
-# esp_timer: atca_hal.c uses esp_timer_get_time() for the per-command elapsed-time deadline.
+# esp_timer: the ESP32 HAL supplies the deadline clock via esp_timer_get_time(). Kept out of
+# atca_deadline.c itself so that unit has no ESP dependency and can be host-tested.
 # Monotonic from boot, so a wall-clock step cannot silently extend a budget.
 set(COMPONENT_REQUIRES      "mbedtls" "freertos"  "driver" "esp_timer")
 
