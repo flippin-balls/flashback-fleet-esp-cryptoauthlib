@@ -95,6 +95,18 @@ typedef struct
     uint32_t budget_ms;        /* per-command allowance; 0 = disabled */
     int64_t  expires_us;       /* this command's expiry; 0 = none in force */
     int64_t  total_expires_us; /* absolute stop for the sequence; 0 = none in force */
+
+    /* REFUSE: this caller may not run commands at all.
+     *
+     * For the case where a caller cannot be given its OWN state. Sharing one is not a safe
+     * degradation -- two callers overwrite each other's expiry, and one calling
+     * atca_deadline_end() clears the other's mid-command, so a command already running loses its
+     * ceiling. Refusing is the honest answer: fail the command fast instead of running it
+     * unbounded.
+     *
+     * Deliberately NOT touched by begin() or end(), so no other caller sharing this state can
+     * clear it. That is the whole point: the timestamps are contended, this flag is not. */
+    bool     refuse;
 } atca_deadline_state_t;
 
 void atca_deadline_set_state_provider(atca_deadline_state_t *(*fn)(void));

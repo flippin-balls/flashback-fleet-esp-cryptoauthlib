@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 /* The default state: one global, exactly as before a provider exists. */
-static atca_deadline_state_t s_default_state = { 0u, 0, 0 };
+static atca_deadline_state_t s_default_state = { 0u, 0, 0, false };
 static atca_deadline_state_t *(*s_state_fn)(void) = NULL;
 
 void atca_deadline_set_state_provider(atca_deadline_state_t *(*fn)(void))
@@ -105,6 +105,11 @@ void atca_deadline_end(void)
 
 bool atca_deadline_expired(void)
 {
+    if (dl()->refuse)
+    {
+        return true;   /* no exclusive state: every command is already over its limit */
+    }
+
     /* Keyed on the EXPIRY, not on dl()->budget_ms. Testing the budget here would ignore a
      * total set by a caller that never set a per-command budget -- exactly how a sequence bound
      * gets silently dropped. */
@@ -132,6 +137,11 @@ uint32_t atca_deadline_remaining_ms(uint32_t cap)
 
 bool atca_deadline_can_start(void)
 {
+    if (dl()->refuse)
+    {
+        return false;   /* refuse BEFORE the command is issued, not after it has run long */
+    }
+
     if (dl()->expires_us == 0)
     {
         return true;   /* no deadline in force: unchanged behaviour */

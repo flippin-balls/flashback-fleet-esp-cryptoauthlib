@@ -344,6 +344,37 @@ int main(void)
         g_cur_state = NULL;
     }
 
+    printf("\n== a REFUSE state fails commands fast instead of running them ==\n");
+    {
+        static atca_deadline_state_t st_r;
+        static atca_deadline_state_t *cur_r;
+        memset(&st_r, 0, sizeof(st_r));
+        st_r.budget_ms = 5000;
+        st_r.refuse    = true;
+        cur_r = &st_r;
+        g_cur_state = &cur_r;
+        atca_deadline_set_state_provider(provide_cur);
+
+        g_now_us = 0;
+        int64_t t0 = g_now_us;
+        ATCA_STATUS st_ref = run_one(&elapsed, &receives);
+        int64_t took = (g_now_us - t0) / 1000;
+        printf("  status=%d elapsed=%lld ms receives=%d\n", (int)st_ref, (long long)took, receives);
+        CHECK(st_ref == ATCA_TIMEOUT, "a refusing caller gets ATCA_TIMEOUT (got %d)", (int)st_ref);
+        CHECK(took < 1000, "it fails FAST rather than running the command (%lld ms)",
+              (long long)took);
+
+        /* And the flag survives what a peer would do to the timestamps: begin()/end() must not
+         * clear it, or a task sharing this state could switch refusal off. */
+        atca_deadline_begin();
+        atca_deadline_end();
+        CHECK(atca_deadline_expired(), "refuse survives begin()/end() from a peer");
+        CHECK(!atca_deadline_can_start(), "refuse still blocks the next command");
+
+        atca_deadline_set_state_provider(NULL);
+        g_cur_state = NULL;
+    }
+
     printf("\n%s\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS");
     return g_fail;
 }
