@@ -66,6 +66,23 @@ void     atca_deadline_set_total_ms(uint32_t ms);
 /* Milliseconds left on the TOTAL, or UINT32_MAX when no total is in force. For a caller that
  * wants to REPORT the overrun rather than merely suffer it. */
 uint32_t atca_deadline_total_remaining_ms(void);
+
+/* NESTED totals.
+ *
+ * set_total_ms(0) CLEARS, which is wrong for anything called from inside another bounded
+ * operation: an inner probe that clears on exit destroys the total its caller was running under,
+ * and every command after it gets a fresh allowance. That is how a loop with a 20 s budget still
+ * reached 34 s -- the budget survived the probe but not past it.
+ *
+ * push/pop instead. push never EXTENDS an outer stop: if the caller already has less time than
+ * you asked for, you get the caller's. pop puts back exactly what was there.
+ *
+ *     const int64_t saved = atca_deadline_push_total_ms(10000);
+ *     ... work ...
+ *     atca_deadline_pop_total(saved);
+ */
+int64_t atca_deadline_push_total_ms(uint32_t ms);
+void    atca_deadline_pop_total(int64_t saved_stop_us);
 uint32_t atca_deadline_get_ms(void);
 
 /** Begin / end one command's budget. end() drops the EXPIRY, keeps the POLICY -- without it a

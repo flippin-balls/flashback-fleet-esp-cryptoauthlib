@@ -228,6 +228,73 @@ int main(void)
           "with the total cleared the old unbounded behaviour is back (%lld ms)",
           (long long)elapsed);
 
+    /* ---------------------------------------------------------------------------------------
+     * AN INNER SCOPE MUST NOT DESTROY ITS CALLER'S TOTAL.
+     *
+     * This is the bug that survived the first total: a wrapper set a total, did its work, and
+     * cleared it with set_total_ms(0) on the way out. Anything the CALLER did afterwards -- still
+     * inside the caller's own budget -- ran with no total at all. codex walked it to 34 s inside
+     * a loop that had asked for 20 s: probe returns, clears, then three AES commands run free. */
+    printf("\n== inner scope clears the outer total (the bug) ==\n");
+    g_now_us = 0;
+    atca_deadline_set_ms(2500);
+    atca_deadline_set_total_ms(2500);            /* the "loop" budget */
+    atca_deadline_set_total_ms(2500);            /* an inner wrapper opens its own ... */
+    atca_deadline_set_total_ms(0);               /* ... and clears on exit -- outer is GONE */
+    seq_start = g_now_us;
+    for (int i = 0; i < 3; i++) { (void)run_one(&elapsed, &receives); }
+    int64_t after_clear_ms = (g_now_us - seq_start) / 1000;
+    printf("  3 commands after an inner clear -> %lld ms\n", (long long)after_clear_ms);
+    CHECK(after_clear_ms > 2500 * 2,
+          "clearing an inner total frees the rest of the caller's work (%lld ms)",
+          (long long)after_clear_ms);
+
+    printf("\n== push/pop keeps the outer total intact ==\n");
+    g_now_us = 0;
+    atca_deadline_set_ms(2500);
+    int64_t outer = atca_deadline_push_total_ms(2500);   /* the loop's budget */
+    int64_t inner = atca_deadline_push_total_ms(2500);   /* an inner wrapper */
+    atca_deadline_pop_total(inner);                      /* inner exits */
+    seq_start = g_now_us;
+    for (int i = 0; i < 3; i++) { (void)run_one(&elapsed, &receives); }
+    int64_t nested_ms = (g_now_us - seq_start) / 1000;
+    atca_deadline_pop_total(outer);
+    printf("  3 commands after an inner pop -> %lld ms\n", (long long)nested_ms);
+    CHECK(nested_ms <= 2500 + RECEIVE_COST_MS,
+          "the caller's total still bounds work done AFTER the inner scope (%lld ms)",
+          (long long)nested_ms);
+    CHECK(nested_ms < after_clear_ms / 2,
+          "push/pop is decisively tighter than clear (%lld vs %lld ms)",
+          (long long)nested_ms, (long long)after_clear_ms);
+
+    printf("\n== push never EXTENDS an outer total ==\n");
+    /* An inner operation asking for more than its caller has left must not be granted it. */
+    g_now_us = 0;
+    atca_deadline_set_ms(0);
+    outer = atca_deadline_push_total_ms(1000);      /* caller has 1 s */
+    inner = atca_deadline_push_total_ms(60000);     /* inner asks for 60 s */
+    seq_start = g_now_us;
+    (void)run_one(&elapsed, &receives);
+    int64_t greedy_ms = (g_now_us - seq_start) / 1000;
+    atca_deadline_pop_total(inner);
+    atca_deadline_pop_total(outer);
+    printf("  inner asked 60000 ms inside a 1000 ms caller -> %lld ms\n", (long long)greedy_ms);
+    CHECK(greedy_ms <= 1000 + RECEIVE_COST_MS,
+          "the tighter OUTER total wins (%lld ms)", (long long)greedy_ms);
+
+    printf("\n== pop restores exactly, and the outermost pop clears ==\n");
+    g_now_us = 0;
+    atca_deadline_set_ms(0);
+    outer = atca_deadline_push_total_ms(5000);
+    CHECK(outer == 0, "push from no-total saves 'no total'");
+    inner = atca_deadline_push_total_ms(1000);
+    atca_deadline_pop_total(inner);
+    CHECK(atca_deadline_total_remaining_ms() > 1000,
+          "after popping the inner scope the OUTER budget is what remains");
+    atca_deadline_pop_total(outer);
+    CHECK(atca_deadline_total_remaining_ms() == UINT32_MAX,
+          "popping the outermost scope leaves no total in force");
+
     printf("\n%s\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS");
     return g_fail;
 }

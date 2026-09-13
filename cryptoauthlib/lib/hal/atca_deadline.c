@@ -145,3 +145,31 @@ uint32_t atca_deadline_total_remaining_ms(void)
     }
     return (uint32_t)(left_us / 1000);
 }
+
+int64_t atca_deadline_push_total_ms(uint32_t ms)
+{
+    const int64_t saved = s_total_expires_us;
+    int64_t want;
+
+    if (ms == 0u)
+    {
+        return saved;   /* "no opinion": inherit whatever the caller already has */
+    }
+
+    want = deadline_now_us() + ((int64_t)ms * 1000);
+
+    /* NEVER EXTEND AN OUTER TOTAL. An inner operation may ask for more than its caller has left;
+     * granting it would let a nested call escape the bound its caller is enforcing, which is the
+     * whole failure this exists to stop. Tighter wins; that is the only direction that is safe. */
+    if (saved == 0 || want < saved)
+    {
+        s_total_expires_us = want;
+    }
+
+    return saved;
+}
+
+void atca_deadline_pop_total(int64_t saved_stop_us)
+{
+    s_total_expires_us = saved_stop_us;
+}
