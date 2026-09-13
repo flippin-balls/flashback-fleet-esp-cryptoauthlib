@@ -49,7 +49,23 @@ void atca_deadline_set_clock(atca_deadline_clock_fn fn);
 int64_t atca_deadline_default_clock_us(void);
 
 /** Budget for each subsequent command. 0 disables (default). */
+/* PER-COMMAND allowance. Each command gets this much, restarted by atca_deadline_begin(). */
 void     atca_deadline_set_ms(uint32_t ms);
+
+/* TOTAL allowance across however many commands follow, as one absolute wall-clock stop.
+ *
+ * The per-command budget alone does NOT bound a sequence: begin() restarts the allowance at
+ * every command, so an operation running N commands takes up to N x the "budget" its caller
+ * asked for. A caller that must not exceed a watchdog cannot express that with set_ms() alone.
+ *
+ * Set this and every subsequent command is clamped to whatever is LEFT of it, so the sequence
+ * as a whole stops on time. 0 clears it. The stop is captured when this is called, so call it
+ * immediately before the work it bounds. */
+void     atca_deadline_set_total_ms(uint32_t ms);
+
+/* Milliseconds left on the TOTAL, or UINT32_MAX when no total is in force. For a caller that
+ * wants to REPORT the overrun rather than merely suffer it. */
+uint32_t atca_deadline_total_remaining_ms(void);
 uint32_t atca_deadline_get_ms(void);
 
 /** Begin / end one command's budget. end() drops the EXPIRY, keeps the POLICY -- without it a

@@ -27,6 +27,7 @@
 #include "atca_deadline.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 static int g_fail = 0;
 #define CHECK(c, m, ...) do { \
@@ -154,6 +155,78 @@ int main(void)
     printf("\n== the expiry does not outlive its command ==\n");
     CHECK(!atca_deadline_expired(),
           "after the command, a later direct wake is not refused by a stale expiry");
+
+    /* ---------------------------------------------------------------------------------------
+     * THE PER-COMMAND BUDGET DOES NOT BOUND A SEQUENCE.
+     *
+     * Every test above runs ONE command, and a single command is precisely the case where a
+     * per-command budget and a total are indistinguishable. That is why the sequence bug
+     * survived a passing suite: the shape of the test could not see it.
+     *
+     * A real recovery is a SEQUENCE -- atcab_release(), then atecc_init() (which reads the
+     * config zone), then a serial-number read. atca_deadline_begin() restarts the allowance at
+     * each one, so a caller asking for "2500 ms" got 2500 ms EACH. Under hermes-bridge's 30 s
+     * task watchdog that is the difference between a bound that protects the device and a bound
+     * that lets it reboot by watchdog while believing itself bounded. */
+    printf("\n== N commands under a PER-COMMAND budget only: the bound does not hold ==\n");
+    g_now_us = 0;
+    atca_deadline_set_total_ms(0);        /* no total: the old behaviour */
+    atca_deadline_set_ms(2500);
+    int64_t seq_start = g_now_us;
+    for (int i = 0; i < 3; i++) { (void)run_one(&elapsed, &receives); }
+    int64_t per_cmd_only_ms = (g_now_us - seq_start) / 1000;
+    printf("  3 commands, 2500 ms per-command budget -> %lld ms total\n",
+           (long long)per_cmd_only_ms);
+    CHECK(per_cmd_only_ms > 2500 * 2,
+          "a per-command budget lets 3 commands run well past it (%lld ms)",
+          (long long)per_cmd_only_ms);
+
+    printf("\n== the same N commands under a 2500 ms TOTAL ==\n");
+    g_now_us = 0;
+    atca_deadline_set_ms(2500);
+    atca_deadline_set_total_ms(2500);
+    seq_start = g_now_us;
+    ATCA_STATUS last = ATCA_SUCCESS;
+    int ran = 0;
+    for (int i = 0; i < 3; i++) { last = run_one(&elapsed, &receives); ran++; }
+    int64_t total_ms = (g_now_us - seq_start) / 1000;
+    printf("  3 commands, 2500 ms TOTAL -> %lld ms total, last status=%d\n",
+           (long long)total_ms, (int)last);
+    CHECK(total_ms <= 2500 + RECEIVE_COST_MS,
+          "the whole sequence finishes within the total (%lld ms)", (long long)total_ms);
+    CHECK(total_ms < per_cmd_only_ms / 2,
+          "the total is decisively tighter than the per-command budget (%lld vs %lld ms)",
+          (long long)total_ms, (long long)per_cmd_only_ms);
+    CHECK(last == ATCA_TIMEOUT,
+          "a command starting after the total is spent reports ATCA_TIMEOUT (got %d)",
+          (int)last);
+    (void)ran;
+
+    printf("\n== a total with NO per-command budget still bounds ==\n");
+    /* The clamp lives in begin(); keying the checks off s_deadline_budget_ms instead of the
+     * expiry would silently drop this case. */
+    g_now_us = 0;
+    atca_deadline_set_ms(0);
+    atca_deadline_set_total_ms(1500);
+    seq_start = g_now_us;
+    for (int i = 0; i < 3; i++) { (void)run_one(&elapsed, &receives); }
+    int64_t total_only_ms = (g_now_us - seq_start) / 1000;
+    printf("  3 commands, total only -> %lld ms\n", (long long)total_only_ms);
+    CHECK(total_only_ms <= 1500 + RECEIVE_COST_MS,
+          "a bare total bounds the sequence with no per-command budget (%lld ms)",
+          (long long)total_only_ms);
+
+    printf("\n== clearing the total restores unbounded behaviour ==\n");
+    g_now_us = 0;
+    atca_deadline_set_total_ms(0);
+    atca_deadline_set_ms(0);
+    CHECK(atca_deadline_total_remaining_ms() == UINT32_MAX,
+          "total_remaining reports 'no total' once cleared");
+    ATCA_STATUS st_clear = run_one(&elapsed, &receives);
+    printf("  status=%d elapsed=%lld ms\n", (int)st_clear, (long long)elapsed);
+    CHECK(elapsed > 200000,
+          "with the total cleared the old unbounded behaviour is back (%lld ms)",
+          (long long)elapsed);
 
     printf("\n%s\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS");
     return g_fail;

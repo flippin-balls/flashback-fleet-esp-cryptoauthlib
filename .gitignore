@@ -1,0 +1,4 @@
+
+# Compiled host-test binaries. They were tracked, so every run of the suite showed up as a
+# source change and a rebuilt artifact got committed alongside the fix it was meant to verify.
+test/host/build/

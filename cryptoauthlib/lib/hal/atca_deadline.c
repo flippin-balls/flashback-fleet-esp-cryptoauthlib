@@ -17,6 +17,14 @@
 static uint32_t s_deadline_budget_ms  = 0;   /* 0 = disabled, and disabled is the default */
 static int64_t  s_deadline_expires_us = 0;
 
+/* Absolute stop for a whole SEQUENCE of commands. 0 = no total in force.
+ *
+ * Separate from the per-command budget because they answer different questions. The budget says
+ * "no single command may take longer than this"; the total says "all of this, together, must be
+ * done by then". A caller sitting under a watchdog needs the second one, and before this existed
+ * it could only ask for the first -- and was silently given N times what it asked for. */
+static int64_t  s_total_expires_us    = 0;
+
 /* Default clock. Weak so a host test can supply its own without touching this file; on target it
  * resolves to the monotonic timer. Monotonic matters: a wall clock can step backwards and would
  * silently extend a deadline. */
@@ -48,12 +56,27 @@ uint32_t atca_deadline_get_ms(void)
 
 void atca_deadline_begin(void)
 {
-    if (s_deadline_budget_ms == 0u)
+    int64_t per = 0;
+
+    if (s_deadline_budget_ms != 0u)
     {
-        s_deadline_expires_us = 0;
-        return;
+        per = deadline_now_us() + ((int64_t)s_deadline_budget_ms * 1000);
     }
-    s_deadline_expires_us = deadline_now_us() + ((int64_t)s_deadline_budget_ms * 1000);
+
+    /* THE TOTAL WINS WHENEVER IT IS SOONER, and applies even with no per-command budget set.
+     *
+     * Doing the clamp here is the whole point: begin() is the one place every command passes
+     * through, so the bound cannot be forgotten by a caller or escaped by a code path that runs
+     * more commands than its caller expected it to. */
+    if (s_total_expires_us != 0)
+    {
+        if (per == 0 || s_total_expires_us < per)
+        {
+            per = s_total_expires_us;
+        }
+    }
+
+    s_deadline_expires_us = per;   /* 0 => no deadline in force */
 }
 
 void atca_deadline_end(void)
@@ -67,7 +90,10 @@ void atca_deadline_end(void)
 
 bool atca_deadline_expired(void)
 {
-    if (s_deadline_budget_ms == 0u || s_deadline_expires_us == 0)
+    /* Keyed on the EXPIRY, not on s_deadline_budget_ms. Testing the budget here would ignore a
+     * total set by a caller that never set a per-command budget -- exactly how a sequence bound
+     * gets silently dropped. */
+    if (s_deadline_expires_us == 0)
     {
         return false;
     }
@@ -76,7 +102,7 @@ bool atca_deadline_expired(void)
 
 uint32_t atca_deadline_remaining_ms(uint32_t cap)
 {
-    if (s_deadline_budget_ms == 0u || s_deadline_expires_us == 0)
+    if (s_deadline_expires_us == 0)
     {
         return cap;
     }
@@ -91,9 +117,31 @@ uint32_t atca_deadline_remaining_ms(uint32_t cap)
 
 bool atca_deadline_can_start(void)
 {
-    if (s_deadline_budget_ms == 0u || s_deadline_expires_us == 0)
+    if (s_deadline_expires_us == 0)
     {
         return true;   /* no deadline in force: unchanged behaviour */
     }
     return atca_deadline_remaining_ms(UINT32_MAX) >= ATCA_DEADLINE_MIN_SLICE_MS;
+}
+
+void atca_deadline_set_total_ms(uint32_t ms)
+{
+    s_total_expires_us = (ms == 0u) ? 0 : (deadline_now_us() + ((int64_t)ms * 1000));
+}
+
+uint32_t atca_deadline_total_remaining_ms(void)
+{
+    int64_t left_us;
+
+    if (s_total_expires_us == 0)
+    {
+        return UINT32_MAX;   /* no total in force */
+    }
+
+    left_us = s_total_expires_us - deadline_now_us();
+    if (left_us <= 0)
+    {
+        return 0u;
+    }
+    return (uint32_t)(left_us / 1000);
 }
