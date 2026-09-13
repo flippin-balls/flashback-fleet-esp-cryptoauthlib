@@ -14,16 +14,31 @@
 #include "atca_deadline.h"
 #include <stddef.h>
 
-static uint32_t s_deadline_budget_ms  = 0;   /* 0 = disabled, and disabled is the default */
-static int64_t  s_deadline_expires_us = 0;
+/* The default state: one global, exactly as before a provider exists. */
+static atca_deadline_state_t s_default_state = { 0u, 0, 0 };
+static atca_deadline_state_t *(*s_state_fn)(void) = NULL;
 
-/* Absolute stop for a whole SEQUENCE of commands. 0 = no total in force.
- *
- * Separate from the per-command budget because they answer different questions. The budget says
- * "no single command may take longer than this"; the total says "all of this, together, must be
- * done by then". A caller sitting under a watchdog needs the second one, and before this existed
- * it could only ask for the first -- and was silently given N times what it asked for. */
-static int64_t  s_total_expires_us    = 0;
+void atca_deadline_set_state_provider(atca_deadline_state_t *(*fn)(void))
+{
+    s_state_fn = fn;
+}
+
+/* Every accessor goes through this. A provider that returns per-task storage makes two callers
+ * independent; without one, behaviour is identical to the single global it replaced. */
+static atca_deadline_state_t *dl(void)
+{
+    if (NULL != s_state_fn)
+    {
+        atca_deadline_state_t *st = s_state_fn();
+        if (NULL != st)
+        {
+            return st;   /* a provider that returns NULL degrades to the global, never crashes */
+        }
+    }
+    return &s_default_state;
+}
+
+
 
 /* Default clock. Weak so a host test can supply its own without touching this file; on target it
  * resolves to the monotonic timer. Monotonic matters: a wall clock can step backwards and would
@@ -46,21 +61,21 @@ static int64_t deadline_now_us(void)
 
 void atca_deadline_set_ms(uint32_t ms)
 {
-    s_deadline_budget_ms = ms;
+    dl()->budget_ms = ms;
 }
 
 uint32_t atca_deadline_get_ms(void)
 {
-    return s_deadline_budget_ms;
+    return dl()->budget_ms;
 }
 
 void atca_deadline_begin(void)
 {
     int64_t per = 0;
 
-    if (s_deadline_budget_ms != 0u)
+    if (dl()->budget_ms != 0u)
     {
-        per = deadline_now_us() + ((int64_t)s_deadline_budget_ms * 1000);
+        per = deadline_now_us() + ((int64_t)dl()->budget_ms * 1000);
     }
 
     /* THE TOTAL WINS WHENEVER IT IS SOONER, and applies even with no per-command budget set.
@@ -68,15 +83,15 @@ void atca_deadline_begin(void)
      * Doing the clamp here is the whole point: begin() is the one place every command passes
      * through, so the bound cannot be forgotten by a caller or escaped by a code path that runs
      * more commands than its caller expected it to. */
-    if (s_total_expires_us != 0)
+    if (dl()->total_expires_us != 0)
     {
-        if (per == 0 || s_total_expires_us < per)
+        if (per == 0 || dl()->total_expires_us < per)
         {
-            per = s_total_expires_us;
+            per = dl()->total_expires_us;
         }
     }
 
-    s_deadline_expires_us = per;   /* 0 => no deadline in force */
+    dl()->expires_us = per;   /* 0 => no deadline in force */
 }
 
 void atca_deadline_end(void)
@@ -85,28 +100,28 @@ void atca_deadline_end(void)
      * timestamp must not outlive the command that set it. Without this, a direct wake or idle --
      * neither of which passes through calib_execute_command() -- inherits a stale expired
      * deadline and is refused before it starts. */
-    s_deadline_expires_us = 0;
+    dl()->expires_us = 0;
 }
 
 bool atca_deadline_expired(void)
 {
-    /* Keyed on the EXPIRY, not on s_deadline_budget_ms. Testing the budget here would ignore a
+    /* Keyed on the EXPIRY, not on dl()->budget_ms. Testing the budget here would ignore a
      * total set by a caller that never set a per-command budget -- exactly how a sequence bound
      * gets silently dropped. */
-    if (s_deadline_expires_us == 0)
+    if (dl()->expires_us == 0)
     {
         return false;
     }
-    return deadline_now_us() >= s_deadline_expires_us;
+    return deadline_now_us() >= dl()->expires_us;
 }
 
 uint32_t atca_deadline_remaining_ms(uint32_t cap)
 {
-    if (s_deadline_expires_us == 0)
+    if (dl()->expires_us == 0)
     {
         return cap;
     }
-    int64_t left_us = s_deadline_expires_us - deadline_now_us();
+    int64_t left_us = dl()->expires_us - deadline_now_us();
     if (left_us <= 0)
     {
         return 0u;
@@ -117,7 +132,7 @@ uint32_t atca_deadline_remaining_ms(uint32_t cap)
 
 bool atca_deadline_can_start(void)
 {
-    if (s_deadline_expires_us == 0)
+    if (dl()->expires_us == 0)
     {
         return true;   /* no deadline in force: unchanged behaviour */
     }
@@ -126,19 +141,19 @@ bool atca_deadline_can_start(void)
 
 void atca_deadline_set_total_ms(uint32_t ms)
 {
-    s_total_expires_us = (ms == 0u) ? 0 : (deadline_now_us() + ((int64_t)ms * 1000));
+    dl()->total_expires_us = (ms == 0u) ? 0 : (deadline_now_us() + ((int64_t)ms * 1000));
 }
 
 uint32_t atca_deadline_total_remaining_ms(void)
 {
     int64_t left_us;
 
-    if (s_total_expires_us == 0)
+    if (dl()->total_expires_us == 0)
     {
         return UINT32_MAX;   /* no total in force */
     }
 
-    left_us = s_total_expires_us - deadline_now_us();
+    left_us = dl()->total_expires_us - deadline_now_us();
     if (left_us <= 0)
     {
         return 0u;
@@ -148,7 +163,7 @@ uint32_t atca_deadline_total_remaining_ms(void)
 
 int64_t atca_deadline_push_total_ms(uint32_t ms)
 {
-    const int64_t saved = s_total_expires_us;
+    const int64_t saved = dl()->total_expires_us;
     int64_t want;
 
     if (ms == 0u)
@@ -163,7 +178,7 @@ int64_t atca_deadline_push_total_ms(uint32_t ms)
      * whole failure this exists to stop. Tighter wins; that is the only direction that is safe. */
     if (saved == 0 || want < saved)
     {
-        s_total_expires_us = want;
+        dl()->total_expires_us = want;
     }
 
     return saved;
@@ -171,5 +186,5 @@ int64_t atca_deadline_push_total_ms(uint32_t ms)
 
 void atca_deadline_pop_total(int64_t saved_stop_us)
 {
-    s_total_expires_us = saved_stop_us;
+    dl()->total_expires_us = saved_stop_us;
 }

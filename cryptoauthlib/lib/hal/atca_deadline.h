@@ -81,6 +81,24 @@ uint32_t atca_deadline_total_remaining_ms(void);
  *     ... work ...
  *     atca_deadline_pop_total(saved);
  */
+/* PER-CALLER STATE.
+ *
+ * All of the above is one global by default, which is correct for a single-threaded user and
+ * WRONG the moment two tasks drive the chip. push/pop assume strictly nested execution; two
+ * interleaved callers can leave a stop installed that BOTH have already popped, so an unrelated
+ * later operation inherits -- or worse, inherits an already-expired -- total.
+ *
+ * Supply a provider and each caller gets its own state. The default keeps the single global, so
+ * nothing changes for existing users or for host tests. */
+typedef struct
+{
+    uint32_t budget_ms;        /* per-command allowance; 0 = disabled */
+    int64_t  expires_us;       /* this command's expiry; 0 = none in force */
+    int64_t  total_expires_us; /* absolute stop for the sequence; 0 = none in force */
+} atca_deadline_state_t;
+
+void atca_deadline_set_state_provider(atca_deadline_state_t *(*fn)(void));
+
 int64_t atca_deadline_push_total_ms(uint32_t ms);
 void    atca_deadline_pop_total(int64_t saved_stop_us);
 uint32_t atca_deadline_get_ms(void);

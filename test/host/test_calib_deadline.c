@@ -108,6 +108,12 @@ static ATCADevice make_device(void) {
     return &g_dev;
 }
 
+/* Lets the test say which caller is "running" right now, the way a task switch would. */
+static atca_deadline_state_t **g_cur_state = NULL;
+static atca_deadline_state_t *provide_cur(void) {
+    return (g_cur_state != NULL) ? *g_cur_state : NULL;
+}
+
 static ATCA_STATUS run_one(int64_t *elapsed_ms, int *receives) {
     ATCAPacket packet;
     memset(&packet, 0, sizeof(packet));
@@ -294,6 +300,49 @@ int main(void)
     atca_deadline_pop_total(outer);
     CHECK(atca_deadline_total_remaining_ms() == UINT32_MAX,
           "popping the outermost scope leaves no total in force");
+
+    /* ---------------------------------------------------------------------------------------
+     * TWO CALLERS, INTERLEAVED. push/pop assume strictly nested execution; two tasks driving the
+     * chip do not obey that. codex's interleaving, with one global state:
+     *
+     *   t=0  A pushes 20 s, saving 0
+     *   t=1  B pushes 10 s, saving A's stop (t=20), installing t=11
+     *   t=2  A exits and pops 0        <- B's total is GONE
+     *   t=3  B exits and pops t=20     <- a stop both have popped is now installed
+     *
+     * Everything after that inherits A's expired total. Matching pops do not save you; the state
+     * has to be per-caller. */
+    printf("\n== two interleaved callers do not corrupt each other ==\n");
+    {
+        static atca_deadline_state_t st_a, st_b;
+        static atca_deadline_state_t *cur;
+        memset(&st_a, 0, sizeof(st_a));
+        memset(&st_b, 0, sizeof(st_b));
+        cur = &st_a;
+        atca_deadline_set_state_provider(provide_cur);
+        g_cur_state = &cur;
+
+        g_now_us = 0;
+        cur = &st_a; int64_t a_saved = atca_deadline_push_total_ms(20000);
+        cur = &st_b; int64_t b_saved = atca_deadline_push_total_ms(10000);
+        cur = &st_a; atca_deadline_pop_total(a_saved);          /* A exits first */
+
+        cur = &st_b;
+        CHECK(atca_deadline_total_remaining_ms() <= 10000 &&
+              atca_deadline_total_remaining_ms() > 9000,
+              "B still has its own total after A exits (%u ms)",
+              (unsigned)atca_deadline_total_remaining_ms());
+        atca_deadline_pop_total(b_saved);
+        CHECK(atca_deadline_total_remaining_ms() == UINT32_MAX,
+              "B's pop leaves B with no total");
+
+        cur = &st_a;
+        CHECK(atca_deadline_total_remaining_ms() == UINT32_MAX,
+              "A is left with no total either - no stop resurrected by B's pop");
+
+        atca_deadline_set_state_provider(NULL);   /* back to the global for anything after */
+        g_cur_state = NULL;
+    }
 
     printf("\n%s\n", g_fail ? "RESULT: FAIL" : "RESULT: PASS");
     return g_fail;
