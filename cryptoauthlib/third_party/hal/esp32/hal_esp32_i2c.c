@@ -22,6 +22,17 @@
 #include "esp_rom_sys.h"
 #include "cryptoauthlib.h"
 #include "esp_idf_version.h"
+#include "sdkconfig.h"
+
+/* Per-firmware ATECC data-handle bus speed. This is what lets the relay run the chip at
+ * 400 kHz while the bridge (same fork, same esp-common) stays at 100 kHz -- it is each
+ * firmware's own Kconfig value, not a shared iface-cfg field. The wake pulse is pinned at
+ * 100 kHz on its own handle regardless. Keeping cfg.atcai2c.baud at 100000 (esp-common's
+ * default) is deliberate: calib_wakeup_i2c only does its per-command change_baud dance when
+ * cfg.baud > 100000, so leaving it at 100000 avoids re-registering the device on every wake. */
+#ifndef CONFIG_ATCA_I2C_BAUD_RATE
+#define CONFIG_ATCA_I2C_BAUD_RATE 100000
+#endif
 
 #if defined(CONFIG_ATCA_I2C_USE_LEGACY_DRIVER)
 #include <driver/i2c.h>
@@ -460,18 +471,10 @@ ATCA_STATUS hal_i2c_init(ATCAIface iface, ATCAIfaceCfg *cfg)
         if (0 == i2c_hal_data[bus].ref_ct) {
             i2c_hal_data[bus].ref_ct = 1;
             i2c_hal_data[bus].port_num = bus;
-            /* The ATECC data handle (0x60) runs at the configured bus speed. In this driver
-             * baud is a per-DEVICE property fixed at add_device time, so the chip's transaction
-             * speed is decided here, not by any later change_baud. Take it from the iface cfg
-             * (cfg->atcai2c.baud), clamped to what the ATECC608A supports: at least 100 kHz, and
-             * no more than the 1 MHz fSCL max in the datasheet. An unset/out-of-range baud falls
-             * back to the safe 100 kHz default. The wake handle (0x00), registered below, is
-             * pinned at 100 kHz regardless -- the wake token only needs SDA held low >= tWLO and
-             * is a deliberate NACK, so it gains nothing from a faster clock and is safest slow.
-             * This is what makes "the chip runs at 400 kHz, only the wake pulse runs at 100" true
-             * per-handle, with no per-transaction reconfiguration. */
             {
-                uint32_t atca_speed = cfg->atcai2c.baud;
+                /* Data handle runs at the firmware's configured baud, clamped to the ATECC608A
+                 * range [100 kHz, 1 MHz fSCL max]; an out-of-range value falls back to 100 kHz. */
+                uint32_t atca_speed = (uint32_t)CONFIG_ATCA_I2C_BAUD_RATE;
                 if (atca_speed < 100000u || atca_speed > 1000000u) {
                     atca_speed = 100000u;
                 }
@@ -543,8 +546,7 @@ ATCA_STATUS hal_i2c_init(ATCAIface iface, ATCAIfaceCfg *cfg)
             i2c_device_config_t wake_cfg = {
                 .dev_addr_length = I2C_ADDR_BIT_LEN_7,
                 .device_address = 0x00,
-                /* Wake pulse stays at 100 kHz even when the data handle runs faster (see the
-                 * note at speed selection above). Do NOT use i2c_hal_data[bus].speed here. */
+                /* Wake pulse stays at 100 kHz even when the data handle runs faster. */
                 .scl_speed_hz = 100000u,
                 .scl_wait_us = 0,
             };
