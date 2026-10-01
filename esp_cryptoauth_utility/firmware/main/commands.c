@@ -13,7 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <freertos/FreeRTOS.h>
@@ -64,6 +67,7 @@ static esp_err_t register_lock_data_zone();
 static esp_err_t register_write_data();
 static esp_err_t register_write_enc_data();
 static esp_err_t register_generate_location_psk();
+static esp_err_t register_gtl24_commands();
 static device_status_t atca_cli_status_object;
 esp_err_t register_command_handler()
 {
@@ -85,6 +89,7 @@ esp_err_t register_command_handler()
     ret |= register_write_data();
     ret |= register_generate_location_psk();
     ret |= register_write_enc_data();
+    ret |= register_gtl24_commands();
     return ret;
 }
 
@@ -1029,4 +1034,166 @@ static esp_err_t register_generate_location_psk()
             .func = &generate_location_psk,
     };
     return esp_console_cmd_register(&cmd);
+}
+
+
+/* ===== GTL 24: write-slot / read-slot / lock-slot / write-pubkey / sleep =========================
+ * Console protocol matches write-data: binary payloads follow the command line and end with one NUL.
+ * Every command prints the "Status: Success|Failure" line the host parses, and returns the honest
+ * result (see write-enc-data: a failed write must never read as success). */
+
+#define GTL24_MAX_WRITE 416
+
+static esp_err_t read_payload(unsigned char *buf, size_t len)
+{
+    ecu_console_interface_t *console_interface = get_console_interface();
+    for (size_t i = 0; i < len; i++) {
+        if (console_interface->read_bytes(&buf[i], 1, portMAX_DELAY) <= 0) {
+            return ESP_FAIL;
+        }
+    }
+    uint8_t null_term;
+    console_interface->read_bytes(&null_term, 1, portMAX_DELAY);
+    return ESP_OK;
+}
+
+/* Whole-token decimal parse with bounds (codex S2 R1.5): "10junk", "", overflow or out-of-range -> false.
+ * atoi() would turn "lock-slot 10junk" into an irreversible lock of slot 10. */
+static bool parse_int(const char *tok, long lo, long hi, int *out)
+{
+    if (tok == NULL || *tok == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || *end != '\0' || v < lo || v > hi) {
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
+static esp_err_t gtl24_ready(void)
+{
+    if (atca_cli_status_object < ATECC_INIT_SUCCESS) {
+        ESP_LOGE(TAG, "Please initialize device before calling this function");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t finish(esp_err_t ret)
+{
+    ESP_LOGI(TAG, "Status: %s\n", ret ? "Failure" : "Success");
+    fflush(stdout);
+    return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t write_slot_cmd(int argc, char **argv)
+{
+    static unsigned char buf[GTL24_MAX_WRITE];
+    int err_code = 0;
+    if (gtl24_ready() != ESP_OK || argc != 4) {
+        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len>  (then <len> raw bytes + NUL)");
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    int slot, offset, len;
+    if (!parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) ||
+        !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    printf("Reading %d bytes of data...\n", len);
+    fflush(stdout);
+    if (read_payload(buf, (size_t)len) != ESP_OK) {
+        return finish(ESP_FAIL);
+    }
+    return finish(atecc_write_slot(slot, offset, buf, (size_t)len, &err_code));
+}
+
+static esp_err_t read_slot_cmd(int argc, char **argv)
+{
+    static unsigned char buf[GTL24_MAX_WRITE];
+    int err_code = 0;
+    if (gtl24_ready() != ESP_OK || argc != 3) {
+        ESP_LOGE(TAG, "Usage: read-slot <slot> <len>");
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    int slot, len;
+    if (!parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 1, GTL24_MAX_WRITE, &len)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    esp_err_t ret = atecc_read_slot(slot, buf, (size_t)len, &err_code);
+    /* The host (fbf_device_config CommandInterpreter.exec_cmd) keeps only what is printed AFTER the Status line,
+     * up to the next prompt -- the same order read-config uses. Data printed first would be discarded (codex S2
+     * R1.2). */
+    finish(ret);
+    if (ret == ESP_OK) {
+        printf("\nData: ");
+        for (int i = 0; i < len; i++) {
+            printf("%02x", buf[i]);
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+    return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t lock_slot_cmd(int argc, char **argv)
+{
+    int err_code = 0;
+    if (gtl24_ready() != ESP_OK || argc != 2) {
+        ESP_LOGE(TAG, "Usage: lock-slot <slot>  (IRREVERSIBLE)");
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    int slot;
+    if (!parse_int(argv[1], 0, 15, &slot)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    return finish(atecc_lock_slot(slot, &err_code));
+}
+
+static esp_err_t write_pubkey_cmd(int argc, char **argv)
+{
+    unsigned char pub[64];
+    int err_code = 0;
+    if (gtl24_ready() != ESP_OK || argc != 2) {
+        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15>  (then 64 raw bytes X||Y + NUL)");
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    int slot;
+    if (!parse_int(argv[1], 8, 15, &slot)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    printf("Reading 64 bytes of data...\n");
+    fflush(stdout);
+    if (read_payload(pub, sizeof pub) != ESP_OK) {
+        return finish(ESP_FAIL);
+    }
+    return finish(atecc_write_pubkey_slot(slot, pub, &err_code));
+}
+
+static esp_err_t sleep_cmd(int argc, char **argv)
+{
+    int err_code = 0;
+    if (gtl24_ready() != ESP_OK || argc != 1) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    return finish(atecc_sleep(&err_code));
+}
+
+static esp_err_t register_gtl24_commands()
+{
+    const esp_console_cmd_t cmds[] = {
+        {.command = "write-slot", .help = "Write <len> raw bytes at <offset> of a data slot\n  Usage: write-slot <slot> <offset> <len>", .func = &write_slot_cmd},
+        {.command = "read-slot", .help = "Read <len> bytes from the start of a data slot (clear-readable slots, after the data lock)\n  Usage: read-slot <slot> <len>", .func = &read_slot_cmd},
+        {.command = "lock-slot", .help = "Individually lock a Lockable data slot (IRREVERSIBLE; after the data lock)\n  Usage: lock-slot <slot>", .func = &lock_slot_cmd},
+        {.command = "write-pubkey", .help = "Write a P-256 public key (64 bytes X||Y) to slot 8-15 in stored format\n  Usage: write-pubkey <slot>", .func = &write_pubkey_cmd},
+        {.command = "sleep", .help = "Put the ATECC to sleep; the next command runs after a wake\n  Usage: sleep", .func = &sleep_cmd},
+    };
+    esp_err_t ret = ESP_OK;
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        ret |= esp_console_cmd_register(&cmds[i]);
+    }
+    return ret;
 }

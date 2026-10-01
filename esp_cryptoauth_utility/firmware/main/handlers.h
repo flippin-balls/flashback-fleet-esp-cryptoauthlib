@@ -47,6 +47,14 @@ esp_err_t atecc_write_enc_data(int target_slot, int block, int enckey_slot,
                                 unsigned char *data_buf, unsigned char *enckey_buf,
                                 unsigned char *num_in, size_t data_len, int *err_ret);
 
+/* GTL 24 (template v2 / module replacement): byte-addressed slot writes and reads, the individual slot
+ * lock, a pubkey-format write, and an explicit sleep. See commands.c for the console syntax. */
+esp_err_t atecc_write_slot(int slot, int offset, unsigned char *data_buf, size_t data_len, int *err_ret);
+esp_err_t atecc_read_slot(int slot, unsigned char *data_buf, size_t data_len, int *err_ret);
+esp_err_t atecc_lock_slot(int slot, int *err_ret);
+esp_err_t atecc_write_pubkey_slot(int slot, unsigned char *pubkey64, int *err_ret);
+esp_err_t atecc_sleep(int *err_ret);
+
 #ifdef __cplusplus
 }
 #endif

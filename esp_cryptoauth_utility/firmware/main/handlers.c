@@ -854,3 +854,130 @@ exit:
     *err_ret = ret;
     return ESP_FAIL;
 }
+
+
+/* ===== GTL 24: template-v2 bench commands ======================================================
+ * The bench flow (device-config-management provisioning/replacement.py) needs to write the on-chip
+ * certificate record across slots 10-12 (72 B each), read it back after the data lock, lock each record
+ * slot individually, write stored-format public keys into 13-15, and put the chip to sleep so the next
+ * command runs after a wake. The existing write-data only writes 32 B at block 0. */
+
+static int slot_size(int slot)
+{
+    if (slot < 8) {
+        return 36;
+    }
+    if (slot == 8) {
+        return 416;
+    }
+    return 72;
+}
+
+esp_err_t atecc_write_slot(int slot, int offset, unsigned char *data_buf, size_t data_len, int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    if (!is_atcab_init) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        goto exit;
+    }
+    if (data_buf == NULL || slot < 0 || slot > 15 || offset < 0 || data_len == 0) {
+        goto exit;
+    }
+    /* calib_write_bytes_zone works in 4-byte words; refuse anything it would silently round. */
+    if ((offset % 4) != 0 || (data_len % 4) != 0 || offset + (int)data_len > slot_size(slot)) {
+        ESP_LOGE(TAG, "write-slot %d: offset %d len %u must be word-aligned and inside the %d-byte slot", slot, offset,
+                 (unsigned)data_len, slot_size(slot));
+        goto exit;
+    }
+    ret = atcab_write_bytes_zone(ATCA_ZONE_DATA, (uint16_t)slot, (size_t)offset, data_buf, data_len);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "write-slot %d failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    *err_ret = ret;
+    return ESP_OK;
+exit:
+    *err_ret = ret;
+    return ESP_FAIL;
+}
+
+esp_err_t atecc_read_slot(int slot, unsigned char *data_buf, size_t data_len, int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    if (!is_atcab_init) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        goto exit;
+    }
+    if (data_buf == NULL || slot < 0 || slot > 15 || data_len == 0 || (data_len % 4) != 0 || (int)data_len > slot_size(slot)) {
+        goto exit;
+    }
+    ret = atcab_read_bytes_zone(ATCA_ZONE_DATA, (uint16_t)slot, 0, data_buf, data_len);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "read-slot %d failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    *err_ret = ret;
+    return ESP_OK;
+exit:
+    *err_ret = ret;
+    return ESP_FAIL;
+}
+
+esp_err_t atecc_lock_slot(int slot, int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    if (!is_atcab_init) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        goto exit;
+    }
+    if (slot < 0 || slot > 15) {
+        goto exit;
+    }
+    ret = atcab_lock_data_slot((uint16_t)slot);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "lock-slot %d failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    *err_ret = ret;
+    return ESP_OK;
+exit:
+    *err_ret = ret;
+    return ESP_FAIL;
+}
+
+esp_err_t atecc_write_pubkey_slot(int slot, unsigned char *pubkey64, int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    if (!is_atcab_init) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        goto exit;
+    }
+    if (pubkey64 == NULL || slot < 8 || slot > 15) {
+        goto exit;
+    }
+    /* atcab_write_pubkey stores the 72-byte (pad, X, pad, Y) format as whole 32-byte blocks, which a secret
+     * public-key slot needs: 4-byte writes are refused there. */
+    ret = atcab_write_pubkey((uint16_t)slot, pubkey64);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "write-pubkey %d failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    *err_ret = ret;
+    return ESP_OK;
+exit:
+    *err_ret = ret;
+    return ESP_FAIL;
+}
+
+esp_err_t atecc_sleep(int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    if (!is_atcab_init) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        *err_ret = ret;
+        return ESP_FAIL;
+    }
+    ret = atcab_sleep();
+    *err_ret = ret;
+    return (ret == ATCA_SUCCESS) ? ESP_OK : ESP_FAIL;
+}
