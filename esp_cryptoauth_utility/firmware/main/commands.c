@@ -13,7 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <freertos/FreeRTOS.h>
@@ -1054,6 +1057,23 @@ static esp_err_t read_payload(unsigned char *buf, size_t len)
     return ESP_OK;
 }
 
+/* Whole-token decimal parse with bounds (codex S2 R1.5): "10junk", "", overflow or out-of-range -> false.
+ * atoi() would turn "lock-slot 10junk" into an irreversible lock of slot 10. */
+static bool parse_int(const char *tok, long lo, long hi, int *out)
+{
+    if (tok == NULL || *tok == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || *end != '\0' || v < lo || v > hi) {
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
 static esp_err_t gtl24_ready(void)
 {
     if (atca_cli_status_object < ATECC_INIT_SUCCESS) {
@@ -1078,10 +1098,9 @@ static esp_err_t write_slot_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len>  (then <len> raw bytes + NUL)");
         return finish(ESP_ERR_INVALID_ARG);
     }
-    int slot = atoi(argv[1]);
-    int offset = atoi(argv[2]);
-    int len = atoi(argv[3]);
-    if (len <= 0 || len > GTL24_MAX_WRITE) {
+    int slot, offset, len;
+    if (!parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) ||
+        !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)) {
         return finish(ESP_ERR_INVALID_ARG);
     }
     printf("Reading %d bytes of data...\n", len);
@@ -1100,20 +1119,24 @@ static esp_err_t read_slot_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: read-slot <slot> <len>");
         return finish(ESP_ERR_INVALID_ARG);
     }
-    int slot = atoi(argv[1]);
-    int len = atoi(argv[2]);
-    if (len <= 0 || len > GTL24_MAX_WRITE) {
+    int slot, len;
+    if (!parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 1, GTL24_MAX_WRITE, &len)) {
         return finish(ESP_ERR_INVALID_ARG);
     }
     esp_err_t ret = atecc_read_slot(slot, buf, (size_t)len, &err_code);
+    /* The host (fbf_device_config CommandInterpreter.exec_cmd) keeps only what is printed AFTER the Status line,
+     * up to the next prompt -- the same order read-config uses. Data printed first would be discarded (codex S2
+     * R1.2). */
+    finish(ret);
     if (ret == ESP_OK) {
         printf("\nData: ");
         for (int i = 0; i < len; i++) {
             printf("%02x", buf[i]);
         }
         printf("\n");
+        fflush(stdout);
     }
-    return finish(ret);
+    return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t lock_slot_cmd(int argc, char **argv)
@@ -1123,7 +1146,11 @@ static esp_err_t lock_slot_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: lock-slot <slot>  (IRREVERSIBLE)");
         return finish(ESP_ERR_INVALID_ARG);
     }
-    return finish(atecc_lock_slot(atoi(argv[1]), &err_code));
+    int slot;
+    if (!parse_int(argv[1], 0, 15, &slot)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
+    return finish(atecc_lock_slot(slot, &err_code));
 }
 
 static esp_err_t write_pubkey_cmd(int argc, char **argv)
@@ -1134,12 +1161,16 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15>  (then 64 raw bytes X||Y + NUL)");
         return finish(ESP_ERR_INVALID_ARG);
     }
+    int slot;
+    if (!parse_int(argv[1], 8, 15, &slot)) {
+        return finish(ESP_ERR_INVALID_ARG);
+    }
     printf("Reading 64 bytes of data...\n");
     fflush(stdout);
     if (read_payload(pub, sizeof pub) != ESP_OK) {
         return finish(ESP_FAIL);
     }
-    return finish(atecc_write_pubkey_slot(atoi(argv[1]), pub, &err_code));
+    return finish(atecc_write_pubkey_slot(slot, pub, &err_code));
 }
 
 static esp_err_t sleep_cmd(int argc, char **argv)
