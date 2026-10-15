@@ -1,0 +1,25 @@
+name: provisioning stub host tests
+
+# The GTL 24 console commands (esp_cryptoauth_utility/firmware/main/gtl24_*.c) against a virtual ATECC608 configured
+# with template v2, plus the --mutate gate (each rule damaged in a copy must turn the suite RED). Plain gcc + python3:
+# the ESP-IDF / CryptoAuthLib surface is shimmed (test/host/shim).
+on:
+  pull_request:
+    paths:
+      - "esp_cryptoauth_utility/firmware/**"
+      - ".github/workflows/stub-host-tests.yml"
+  push:
+    branches: [feature/i2c-master-driver-migration, master]
+    paths:
+      - "esp_cryptoauth_utility/firmware/**"
+      - ".github/workflows/stub-host-tests.yml"
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: host suite
+        run: sh esp_cryptoauth_utility/firmware/test/host/build_gtl24.sh
+      - name: mutation gate
+        run: sh esp_cryptoauth_utility/firmware/test/host/build_gtl24.sh --mutate

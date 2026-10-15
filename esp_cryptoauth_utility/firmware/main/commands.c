@@ -30,6 +30,7 @@
 
 #include "commands.h"
 #include "handlers.h"
+#include "gtl24.h"
 #include "ecu_console_interface.h"
 
 #define CRYPT_BUF_LEN 1200
@@ -85,6 +86,7 @@ esp_err_t register_command_handler()
     ret |= register_write_data();
     ret |= register_generate_location_psk();
     ret |= register_write_enc_data();
+    ret |= register_gtl24_commands();
     return ret;
 }
 
@@ -1029,4 +1031,10 @@ static esp_err_t register_generate_location_psk()
             .func = &generate_location_psk,
     };
     return esp_console_cmd_register(&cmd);
+}
+
+/* GTL 24 (gtl24_cmds.c): the same readiness test every command above uses. */
+bool ecu_cli_atecc_ready(void)
+{
+    return atca_cli_status_object >= ATECC_INIT_SUCCESS;
 }

@@ -854,3 +854,9 @@ exit:
     *err_ret = ret;
     return ESP_FAIL;
 }
+
+/* GTL 24 (gtl24_slots.c): whether init_atecc608a() succeeded. */
+bool atecc_is_initialized(void)
+{
+    return is_atcab_init;
+}
