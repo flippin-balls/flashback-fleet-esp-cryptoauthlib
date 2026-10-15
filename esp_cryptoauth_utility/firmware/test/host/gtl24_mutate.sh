@@ -10,15 +10,28 @@ here, main = sys.argv[1:3]
 C, S = "gtl24_cmds.c", "gtl24_slots.c"
 M = [
   # framing (gtl24_cmds.c)
-  (C, "terminator not checked",          "    if (term != 0) {", "    if (0) {"),
-  (C, "terminator absence tolerated",    "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);\n        return ESP_FAIL;", "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);"),
-  (C, "short payload tolerated",         "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            return ESP_FAIL;", "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            break;"),
-  (C, "mismatch not drained",            "                 term);\n        drain_payload();\n", "                 term);\n"),
-  (C, "drain stops after one byte",      "    for (int n = 0; n < GTL24_DRAIN_MAX; n++) {", "    for (int n = 0; n < 1; n++) {"),
-  (C, "write-slot bad args not drained", "        ESP_LOGE(TAG, \"Usage: write-slot <slot> <offset> <len>  (then <len> raw bytes + NUL)\");\n        drain_payload();", "        ESP_LOGE(TAG, \"Usage: write-slot <slot> <offset> <len>  (then <len> raw bytes + NUL)\");"),
-  (C, "write-pubkey bad args not drained", "        ESP_LOGE(TAG, \"Usage: write-pubkey <slot 8-15>  (then 64 raw bytes X||Y + NUL)\");\n        drain_payload();", "        ESP_LOGE(TAG, \"Usage: write-pubkey <slot 8-15>  (then 64 raw bytes X||Y + NUL)\");"),
-  (C, "uninitialised write-slot not drained", "        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        drain_payload();\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    printf(\"Reading %d bytes", "        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    printf(\"Reading %d bytes"),
-  (C, "uninitialised write-pubkey not drained", "        drain_payload();\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    printf(\"Reading 64 bytes", "        return finish(ESP_ERR_INVALID_STATE);\n    }\n    printf(\"Reading 64 bytes"),
+  (C, "short payload tolerated",         "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            return false;", "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            break;"),
+  (C, "terminator absence tolerated",    "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);\n        return false;", "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);"),
+  (C, "terminator not checked",          "    if (b != 0) {", "    if (0) {"),
+  (C, "settle check dropped (R1.2)",     "    if (console->read_bytes(&b, 1, pdMS_TO_TICKS(GTL24_SETTLE_MS)) > 0) {", "    if (0) {"),
+  (C, "settle window zero",              "#define GTL24_SETTLE_MS      100", "#define GTL24_SETTLE_MS      0"),
+  (C, "first-byte wait shortened",       "#define GTL24_FIRST_BYTE_MS  5000", "#define GTL24_FIRST_BYTE_MS  1000"),
+  (C, "first-byte wait unbounded",       "#define GTL24_FIRST_BYTE_MS  5000", "#define GTL24_FIRST_BYTE_MS  600000"),
+  (C, "next-byte wait unbounded (R1.1)", "#define GTL24_NEXT_BYTE_MS   1000", "#define GTL24_NEXT_BYTE_MS   600000"),
+  (C, "first byte gets the short wait",  "(i == 0) ? GTL24_FIRST_BYTE_MS : GTL24_NEXT_BYTE_MS", "GTL24_NEXT_BYTE_MS"),
+  (C, "no halt after a broken frame",    "    gtl24_halt();\n    return ESP_FAIL;", "    (void)gtl24_halt;\n    return ESP_FAIL;"),
+  (C, "halt returns to the console loop", "        prompt();\n        for (;;) {", "        prompt();\n        return;\n        for (;;) {"),
+  (C, "halted stub answers nothing",     "        finish(ESP_FAIL);\n        printf(\"HALTED", "        printf(\"HALTED"),
+  (C, "halted stub prompts only once",   "    for (;;) {\n        prompt();\n        for (;;) {", "    prompt();\n    for (;;) {\n        for (;;) {"),
+  (C, "reason before the Status line",   ["static esp_err_t fail_stop(const char *what)\n{\n    finish(ESP_FAIL);\n", "    gtl24_halt();\n    return ESP_FAIL;"], ["static esp_err_t fail_stop(const char *what)\n{\n", "    finish(ESP_FAIL);\n    gtl24_halt();\n    return ESP_FAIL;"]),
+  (C, "bad write-slot args just fail",   "        return fail_stop(\"write-slot arguments: the payload length cannot be trusted\");", "        return finish(ESP_ERR_INVALID_ARG);"),
+  (C, "bad write-pubkey args just fail", "        return fail_stop(\"write-pubkey arguments\");", "        return finish(ESP_ERR_INVALID_ARG);"),
+  (C, "uninitialised write-slot frame left", "        if (!consume_frame(NULL, (size_t)len)) {\n            return fail_stop(\"write-slot payload\");\n        }\n", ""),
+  (C, "uninitialised write-pubkey frame left", "        if (!consume_frame(NULL, sizeof pub)) {\n            return fail_stop(\"write-pubkey payload\");\n        }\n", ""),
+  (C, "uninitialised broken write-slot frame tolerated", "        if (!consume_frame(NULL, (size_t)len)) {\n            return fail_stop(\"write-slot payload\");\n        }", "        (void)consume_frame(NULL, (size_t)len);"),
+  (C, "uninitialised broken write-pubkey frame tolerated", "        if (!consume_frame(NULL, sizeof pub)) {\n            return fail_stop(\"write-pubkey payload\");\n        }", "        (void)consume_frame(NULL, sizeof pub);"),
+  (C, "write-slot writes a broken frame", "    if (!consume_frame(buf, (size_t)len)) {\n        return fail_stop(\"write-slot payload\");\n    }", "    (void)consume_frame(buf, (size_t)len);"),
+  (C, "write-pubkey writes a broken frame", "    if (!consume_frame(pub, sizeof pub)) {\n        return fail_stop(\"write-pubkey payload\");\n    }", "    (void)consume_frame(pub, sizeof pub);"),
   # parsing and readiness (gtl24_cmds.c)
   (C, "parse accepts trailing junk",     "end == tok || *end != '\\0' ||", "end == tok ||"),
   (C, "parse ignores the upper bound",   "v < lo || v > hi)", "v < lo || (v > hi && 0))"),
@@ -28,7 +41,8 @@ M = [
   (C, "write-slot argc unchecked",       "    if (argc != 4 || !parse_int(argv[1], 0, 15, &slot)", "    if (argc < 4 || !parse_int(argv[1], 0, 15, &slot)"),
   (C, "write-slot len 0 allowed",        "!parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)", "!parse_int(argv[3], 0, GTL24_MAX_WRITE, &len)"),
   (C, "write-pubkey slot 7 allowed",     "!parse_int(argv[1], 8, 15, &slot)", "!parse_int(argv[1], 7, 15, &slot)"),
-  (C, "write-slot readiness unchecked",  "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        drain_payload();\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    printf(\"Reading %d", "    printf(\"Reading %d"),
+  (C, "write-slot readiness unchecked",  "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        if (!consume_frame(NULL, (size_t)len)) {\n            return fail_stop(\"write-slot payload\");\n        }\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n", ""),
+  (C, "write-pubkey readiness unchecked (cmd)", "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        if (!consume_frame(NULL, sizeof pub)) {\n            return fail_stop(\"write-pubkey payload\");\n        }\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n", ""),
   (C, "read-slot readiness unchecked",   "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    const esp_err_t ret", "    const esp_err_t ret"),
   (C, "lock-slot readiness unchecked",   "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    return finish(atecc_lock_slot", "    return finish(atecc_lock_slot"),
   (C, "sleep readiness unchecked (cmd)", "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    return finish(atecc_sleep", "    return finish(atecc_sleep"),
@@ -64,7 +78,7 @@ def run(srcdir):
     objs = []
     for f in ("gtl24_cmds", "gtl24_slots"):
         o = os.path.join(b, f + ".o")
-        c = subprocess.run(["gcc"] + cflags + ["-DVT_CAPTURE_REMAP", "-include", os.path.join(here, "shim/capture.h"), "-c", os.path.join(srcdir, f + ".c"), "-o", o], capture_output=True)
+        c = subprocess.run(["gcc"] + cflags + ["-DGTL24_HOST_TEST", "-DVT_CAPTURE_REMAP", "-include", os.path.join(here, "shim/capture.h"), "-c", os.path.join(srcdir, f + ".c"), "-o", o], capture_output=True)
         if c.returncode: return "uncompilable"
         objs.append(o)
     exe = os.path.join(b, "t")
@@ -81,8 +95,10 @@ for f, name, a, b in M:
     d = tempfile.mkdtemp(dir=tmp)
     for g in (C, S): shutil.copy(os.path.join(main, g), d)
     s = open(os.path.join(d, f)).read()
-    if s.count(a) != 1: print("  STALE        %s" % name); other += 1; continue
-    open(os.path.join(d, f), "w").write(s.replace(a, b, 1))
+    pairs = list(zip(a, b)) if isinstance(a, list) else [(a, b)]
+    if any(s.count(x) != 1 for x, _ in pairs): print("  STALE        %s" % name); other += 1; continue
+    for x, y in pairs: s = s.replace(x, y, 1)
+    open(os.path.join(d, f), "w").write(s)
     r = run(d)
     if r == "fail": killed += 1; print("  killed       %s" % name)
     else: other += 1; print("  %-12s %s" % ("UNCOMPILABLE" if r == "uncompilable" else "SURVIVED", name))

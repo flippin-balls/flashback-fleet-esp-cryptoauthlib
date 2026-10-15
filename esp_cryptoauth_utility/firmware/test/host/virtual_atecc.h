@@ -27,6 +27,7 @@ typedef struct {
     int     block_writes, word_writes, refused;
     int     atcab_calls;   /* every CryptoAuthLib call the stub made */
     bool    fail_sleep;    /* fault injection: the next atcab_sleep() fails */
+    int     prompts;       /* "\n>>\n" written straight to the console (the halt's; the loop's own are not modelled) */
 } vatecc_t;
 
 extern vatecc_t VA;
@@ -39,10 +40,14 @@ void va_lock_config(void);
 void va_lock_data(void);
 bool va_slot_locked(int slot);
 
-/* console: bytes the "host" sends after a command line */
-void   va_feed(const uint8_t *b, size_t n);
-size_t va_pending(void);
-void   va_clear_input(void);
+/* console: the bytes the "host" sends, each with an arrival time on a virtual millisecond clock. A read with a timeout
+ * advances the clock to the next byte's arrival if it lands within the wait, else by the whole wait and returns 0; a
+ * portMAX_DELAY read on an exhausted stream returns 0 (the session is over). */
+void     va_feed(const uint8_t *b, size_t n);                        /* arrives with the previous chunk */
+void     va_feed_after(uint32_t gap_ms, const uint8_t *b, size_t n); /* arrives gap_ms after the previous chunk */
+size_t   va_pending(void);
+void     va_clear_input(void);                                       /* empty stream, clock and arrivals at 0 */
+uint32_t va_now(void);
 
 /* output capture */
 void        vt_capture_reset(void);

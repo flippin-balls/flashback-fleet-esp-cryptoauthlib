@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ecu_console_interface.h"
 #include "esp_console.h"
 #include "gtl24.h"
 #include "virtual_atecc.h"
@@ -53,14 +54,10 @@ static esp_console_cmd_func_t find(const char *name)
     return NULL;
 }
 
-/* Run "line" with an optional payload the way the host sends it (payload bytes, then one NUL when `nul`). Returns the
- * handler's return code; the output is in vt_captured(). */
-static int run(const char *line, const uint8_t *payload, size_t n, int nul)
+/* Run one command line against whatever the stream holds. Returns the handler's code; the output is in vt_captured(). */
+static int call(const char *line)
 {
-    va_clear_input();
     vt_capture_reset();
-    if (payload) va_feed(payload, n);
-    if (nul) { const uint8_t z = 0; va_feed(&z, 1); }
     char buf[256];
     snprintf(buf, sizeof buf, "%s", line);
     char *argv[8];
@@ -71,10 +68,60 @@ static int run(const char *line, const uint8_t *payload, size_t n, int nul)
     return f(argc, argv);
 }
 
+/* Run "line" with an optional payload the way the host sends it (payload bytes, then one NUL when `nul`). */
+static int run(const char *line, const uint8_t *payload, size_t n, int nul)
+{
+    va_clear_input();
+    if (payload) va_feed(payload, n);
+    if (nul) { const uint8_t z = 0; va_feed(&z, 1); }
+    return call(line);
+}
+
+/* app_main.c scli_loop, modelled: read to '\r' (at most 1023 bytes), drop the last character, run the line through the
+ * registry. Ends when the stream is exhausted (the target's read would block). Returns the lines dispatched. */
+static int session(void)
+{
+    vt_capture_reset();
+    int lines = 0;
+    for (;;) {
+        char line[1024] = {0};
+        int i = 0;
+        do {
+            if (get_console_interface()->read_bytes((uint8_t *)&line[i], 1, portMAX_DELAY) <= 0) return lines;
+            i++;
+        } while (i < 1023 && line[i - 1] != '\r');
+        const size_t len = strlen(line);
+        if (len == 0) continue;   /* (the target writes linebuf[-1] here -- pre-existing; no stream below reaches it) */
+        line[len - 1] = '\0';
+        lines++;
+        char *argv[8];
+        int argc = 0;
+        for (char *t = strtok(line, " "); t && argc < 8; t = strtok(NULL, " ")) argv[argc++] = t;
+        esp_console_cmd_func_t f = argc ? find(argv[0]) : NULL;
+        if (f) f(argc, argv);
+    }
+}
+
+static const uint8_t NUL1[1] = {0};
+static void feed_str_after(uint32_t gap_ms, const char *str) { va_feed_after(gap_ms, (const uint8_t *)str, strlen(str)); }
+
+static int count(const char *hay, const char *needle)
+{
+    int c = 0;
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + 1, needle)) c++;
+    return c;
+}
+
 static int ok(void) { return strstr(vt_captured(), "Status: Success") != NULL && strstr(vt_captured(), "Status: Failure") == NULL; }
 static int failed(void) { return strstr(vt_captured(), "Status: Failure") != NULL && strstr(vt_captured(), "Status: Success") == NULL; }
 
-static void blank_v2(void) { va_reset(TEMPLATE_V2); VA_ATCAB_INIT = true; VA_CLI_READY = true; }
+static void blank_v2(void) { va_reset(TEMPLATE_V2); VA_ATCAB_INIT = true; VA_CLI_READY = true; va_clear_input(); }
+
+/* The stub halted: it wrote the prompt itself (a handler that returns leaves the prompt to the console loop). */
+static int halted(void) { return VA.prompts > 0; }
+
+/* A fresh stub load on the same chip: what re-running the flow does after a halt. */
+static void reload(void) { VA.prompts = 0; VA.atcab_calls = 0; }
 
 static void fill(uint8_t *b, size_t n, unsigned seed)
 {
@@ -139,6 +186,7 @@ static void test_template_v2_flow(void)
     CHECK(failed(), "a second lock of the same slot fails");
     run("write-slot 10 0 72", rec[0], 72, 1);
     CHECK(failed() && va_pending() == 0, "a locked record slot refuses a write");
+    CHECK(!halted(), "a whole flow never halts");
 }
 
 static void test_pubkey_rules(void)
@@ -155,8 +203,10 @@ static void test_pubkey_rules(void)
     CHECK(failed() && va_pending() == 0, "slot 14 (WriteConfig Never) refuses after the data lock");
     run("write-pubkey 13", pub, 64, 1);
     CHECK(ok(), "slot 13 (PubInvalid) takes block writes after the data lock");
+    CHECK(!halted(), "a refusal by the chip is not a framing error");
+    VA.atcab_calls = 0;
     run("write-pubkey 7", pub, 64, 1);
-    CHECK(failed() && va_pending() == 0, "slot 7 is not a public-key slot: refused, payload drained");
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "slot 7 is not a public-key slot: refused, the stub halts");
     /* Why write-pubkey and not write-slot: a secret slot refuses the 4-byte words a 72-byte write ends with. */
     blank_v2();
     va_lock_config();
@@ -174,26 +224,159 @@ static void test_framing(void)
     va_lock_config();
     va_lock_data();
     run("write-slot 11 0 72", rec, 64, 0);   /* the host dies 8 bytes short */
-    CHECK(failed() && va_pending() == 0, "a short payload fails (bounded wait, no hang): %s", vt_captured());
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "a short payload: Failure, halt, no write: %s", vt_captured());
     CHECK(strstr(vt_captured(), "got 64 of 72 bytes") && !strstr(vt_captured(), "terminator"),
           "and says exactly that (no terminator noise): %s", vt_captured());
-    CHECK(VA.data[11][0] == 0 && VA.data[11][1] == 0, "nothing written from a short payload");
+    const char *st = strstr(vt_captured(), "Status: Failure");
+    const char *why = strstr(vt_captured(), "FRAMING ERROR");
+    CHECK(st && why && st < why, "the reason follows the Status line (the host shows that text): %s", vt_captured());
+    reload();
     uint8_t longer[76];
     fill(longer, 76, 5);
     longer[72] = 0x41;
     run("write-slot 11 0 72", longer, 76, 1);   /* 4 bytes more than declared */
-    CHECK(failed() && va_pending() == 0, "a length mismatch fails and the rest is drained: %s", vt_captured());
+    CHECK(failed() && halted() && va_pending() == 0 && VA.atcab_calls == 0, "a length mismatch: Failure, halt, no write");
     CHECK(strstr(vt_captured(), "not the NUL terminator") != NULL, "says why");
+    reload();
+    longer[72] = 0x00;   /* codex R1.2: the byte at <len> happens to be 0x00 */
+    run("write-slot 11 0 72", longer, 76, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "an oversized payload with 0x00 at <len>: Failure, halt, no write");
+    CHECK(strstr(vt_captured(), "more input after") != NULL, "says why: %s", vt_captured());
+    reload();
     run("write-slot 11 0 72", rec, 72, 0);   /* no NUL */
-    CHECK(failed() && strstr(vt_captured(), "no NUL terminator") && !strstr(vt_captured(), "not the NUL terminator"),
-          "a missing NUL fails and says so: %s", vt_captured());
+    CHECK(failed() && halted() && strstr(vt_captured(), "no NUL terminator") &&
+              !strstr(vt_captured(), "not the NUL terminator"),
+          "a missing NUL: Failure, halt, and says so: %s", vt_captured());
+    reload();
     run("write-slot 11 0 72", NULL, 0, 0);   /* nothing at all */
-    CHECK(failed(), "no payload at all: Failure, not a hang");
+    CHECK(failed() && halted() && strstr(vt_captured(), "got 0 of 72"), "no payload at all: Failure, not a hang");
+    reload();
     run("write-slot 11 0 72", rec, 72, 1);
-    CHECK(ok() && memcmp(VA.data[11], rec, 72) == 0, "and a proper payload still works afterwards");
+    CHECK(ok() && !halted() && memcmp(VA.data[11], rec, 72) == 0, "a fresh load takes a proper payload");
+
+    /* write-pubkey frames the same way (before the data lock, as the flow writes the trust anchors) */
+    blank_v2();
+    va_lock_config();
+    uint8_t pub[70];
+    fill(pub, 70, 13);
+    run("write-pubkey 13", pub, 60, 0);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "got 60 of 64"),
+          "a short public key: Failure, halt, nothing written: %s", vt_captured());
+    reload();
+    pub[64] = 0x00;
+    run("write-pubkey 13", pub, 70, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "more input after"),
+          "an oversized public key with 0x00 at byte 64: Failure, halt, nothing written");
+    reload();
+    run("write-pubkey 13", pub, 64, 1);
+    CHECK(ok() && !halted(), "a whole public key frame is written");
 }
 
-static void test_bad_arguments_drain(void)
+/* Arrival times: the waits are bounded and the frame must be followed by a quiet line. */
+static int timed_write(uint32_t first_ms, uint32_t mid_ms, uint32_t nul_ms, uint32_t extra_ms, uint8_t *rec)
+{
+    fill(rec, 72, 55);
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    va_feed_after(first_ms, rec, 32);
+    va_feed_after(mid_ms, &rec[32], 40);
+    va_feed_after(nul_ms, NUL1, 1);
+    if (extra_ms) feed_str_after(extra_ms, "lock-slot 11\r");
+    return call("write-slot 10 0 72");
+}
+
+static void test_timing(void)
+{
+    uint8_t rec[72];
+    timed_write(4900, 0, 0, 0, rec);
+    CHECK(ok() && !halted() && memcmp(VA.data[10], rec, 72) == 0, "the first byte may take 4.9 s: %s", vt_captured());
+    CHECK(va_now() == 4900 + 100, "the answer waits a 100 ms quiet line after the NUL (now %u)", (unsigned)va_now());
+    timed_write(5100, 0, 0, 0, rec);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "got 0 of 72"), "5.1 s: halt");
+    timed_write(100, 900, 0, 0, rec);
+    CHECK(ok() && !halted(), "a 0.9 s gap mid-payload is tolerated");
+    timed_write(100, 1100, 0, 0, rec);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "got 32 of 72"), "a 1.1 s gap: halt");
+    timed_write(100, 0, 900, 0, rec);
+    CHECK(ok() && !halted(), "the NUL may take 0.9 s");
+    timed_write(100, 0, 1100, 0, rec);
+    CHECK(failed() && halted() && strstr(vt_captured(), "no NUL terminator"), "the NUL after 1.1 s: halt");
+    timed_write(100, 0, 0, 90, rec);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && !va_slot_locked(11) && strstr(vt_captured(), "more input after"),
+          "input 90 ms after the NUL: halt, no write, the trailing command not run: %s", vt_captured());
+    CHECK(count(vt_captured(), "Status: Failure") == 2 && VA.prompts == 2,
+          "the halted stub answers the trailing line too (Failure + prompt), so the host never waits forever");
+}
+
+/* The console loop itself: no byte of a broken frame is ever dispatched, and a whole frame's bytes are data. */
+static void test_session(void)
+{
+    /* codex R1.2's stream: an oversized payload whose byte at <len> is 0x00, followed by a command */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    feed_str_after(0, "write-slot 10 0 4\r");
+    feed_str_after(100, "ABCD");
+    va_feed(NUL1, 1);
+    feed_str_after(0, "lock-slot 11\r");
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && VA.atcab_calls == 0 && halted(),
+          "R1.2: the trailing \"lock-slot 11\" is never dispatched, nothing written: %s", vt_captured());
+
+    /* codex R1.1's stream: the payload stalls past the next-byte wait, then the rest carries a command */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    uint8_t part[32];
+    memset(part, 'x', sizeof part);
+    feed_str_after(0, "write-slot 11 0 72\r");
+    va_feed_after(100, part, 32);
+    feed_str_after(1500, "lock-slot 11\r");
+    va_feed(part, 27);
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && VA.atcab_calls == 0 && halted() &&
+              !strstr(vt_captured(), "Status: Success"),
+          "R1.1: the late remainder is never dispatched: %s", vt_captured());
+
+    /* untrusted arguments: the payload's length is unknown, so the stub halts before reading it */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    feed_str_after(0, "write-slot 10 0\r");
+    feed_str_after(100, "lock-slot 11\r");
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && halted(), "bad arguments: the payload is never dispatched");
+
+    /* the host's real stream: a whole frame whose bytes contain "\rlock-slot 11\r" is data, then the next commands */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    uint8_t rec[72];
+    fill(rec, 72, 77);
+    memcpy(&rec[10], "\rlock-slot 11\r", 14);
+    feed_str_after(0, "write-slot 10 0 72\r");
+    va_feed_after(100, rec, 72);
+    va_feed(NUL1, 1);
+    feed_str_after(300, "read-slot 10 72\r");
+    feed_str_after(300, "lock-slot 10\r");
+    const int n = session();
+    CHECK(n == 3 && memcmp(VA.data[10], rec, 72) == 0 && va_slot_locked(10) && !va_slot_locked(11) && !halted() &&
+              count(vt_captured(), "Status: Success") == 3,
+          "a whole frame: written as data, then exactly the host's next two commands (%d lines): %s", n, vt_captured());
+
+    /* not initialized: the whole frame is consumed, the next line is the host's */
+    blank_v2();
+    VA_CLI_READY = false;
+    feed_str_after(0, "write-slot 10 0 72\r");
+    va_feed_after(100, rec, 72);
+    va_feed(NUL1, 1);
+    feed_str_after(300, "sleep\r");
+    CHECK(session() == 2 && !halted() && !va_slot_locked(11) && VA.atcab_calls == 0 &&
+              count(vt_captured(), "Status: Failure") == 2,
+          "not initialized: the frame is consumed whole, then the host's next command");
+}
+static void test_bad_arguments(void)
 {
     uint8_t rec[72];
     fill(rec, 72, 21);
@@ -205,14 +388,15 @@ static void test_bad_arguments_drain(void)
         va_lock_config();
         va_lock_data();
         run(bad[i], rec, 72, 1);
-        CHECK(failed() && va_pending() == 0 && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
-              "\"%s\": Failure before the payload is read (drained, not read), no chip call", bad[i]);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
+              "\"%s\": the payload length cannot be trusted -- Failure and halt before reading it, no chip call", bad[i]);
     }
     blank_v2();
     va_lock_config();
     va_lock_data();
     run("write-slot 10 2 72", rec, 72, 1);
-    CHECK(failed() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0, "unaligned offset refused");
+    CHECK(failed() && !halted() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0,
+          "unaligned offset refused by the chip layer (whole frame consumed, no halt)");
     run("write-slot 10 0 70", rec, 70, 1);
     CHECK(failed() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0, "unaligned length refused");
     run("write-slot 10 4 72", rec, 72, 1);
@@ -226,8 +410,8 @@ static void test_bad_arguments_drain(void)
         blank_v2();
         va_lock_config();
         run(badpk[i], pub, 64, 1);
-        CHECK(failed() && va_pending() == 0 && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
-              "\"%s\": Failure before the payload is read, drained, no chip call", badpk[i]);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
+              "\"%s\": Failure and halt before reading the payload, no chip call", badpk[i]);
     }
     const char *badno[] = {"read-slot 10", "read-slot 10 0", "read-slot 10 73", "read-slot 17 72", "lock-slot",
                            "lock-slot 10junk", "lock-slot 16", "sleep now"};
@@ -236,7 +420,8 @@ static void test_bad_arguments_drain(void)
         va_lock_config();
         va_lock_data();
         run(badno[i], NULL, 0, 0);
-        CHECK(failed() && !va_slot_locked(10) && VA.sleeps == 0, "\"%s\": Failure, no effect", badno[i]);
+        CHECK(failed() && !halted() && !va_slot_locked(10) && VA.sleeps == 0, "\"%s\": Failure, no effect, no halt",
+              badno[i]);
     }
 }
 
@@ -249,9 +434,16 @@ static void test_not_initialized(void)
     va_lock_data();
     VA_CLI_READY = false;
     run("write-slot 10 0 72", rec, 72, 1);
-    CHECK(failed() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0, "write-slot before init: drained");
+    CHECK(failed() && !halted() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0,
+          "write-slot before init: Failure, the whole frame consumed");
     run("write-pubkey 13", rec, 64, 1);
-    CHECK(failed() && va_pending() == 0, "write-pubkey before init: drained");
+    CHECK(failed() && !halted() && va_pending() == 0, "write-pubkey before init: Failure, the whole frame consumed");
+    run("write-slot 10 0 72", rec, 64, 0);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "before init, a broken frame still halts");
+    reload();
+    run("write-pubkey 13", rec, 60, 0);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "before init, a broken public-key frame still halts");
+    reload();
     run("read-slot 10 72", NULL, 0, 0);
     CHECK(failed() && strstr(vt_captured(), "Data:") == NULL, "read-slot before init");
     run("lock-slot 10", NULL, 0, 0);
@@ -365,11 +557,13 @@ int main(void)
     test_template_v2_flow();
     test_pubkey_rules();
     test_framing();
-    test_bad_arguments_drain();
+    test_bad_arguments();
     test_not_initialized();
     test_read_rules();
     test_lock_rules();
     test_sleep();
+    test_timing();
+    test_session();
     test_handlers_direct();
     test_sleep_failure();
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);

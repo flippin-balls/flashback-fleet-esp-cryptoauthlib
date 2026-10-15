@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "capture.h"
 #include "cryptoauthlib.h"
 #include "ecu_console_interface.h"
 #include "esp_console.h"
@@ -151,24 +152,51 @@ bool ecu_cli_atecc_ready(void) { return VA_CLI_READY; }
 
 /* ---- the console byte stream ------------------------------------------------------------------------------------- */
 
-static uint8_t s_in[8192];
-static size_t s_in_head, s_in_tail;
+static uint8_t  s_in[8192];
+static uint32_t s_at[8192];   /* arrival time of each byte */
+static size_t   s_in_head, s_in_tail;
+static uint32_t s_now, s_last_at;
 
-void va_feed(const uint8_t *b, size_t n)
+void va_feed_after(uint32_t gap_ms, const uint8_t *b, size_t n)
 {
-    for (size_t i = 0; i < n && s_in_tail < sizeof s_in; i++) s_in[s_in_tail++] = b[i];
+    s_last_at += gap_ms;
+    for (size_t i = 0; i < n && s_in_tail < sizeof s_in; i++) {
+        s_at[s_in_tail] = s_last_at;
+        s_in[s_in_tail++] = b[i];
+    }
 }
+void va_feed(const uint8_t *b, size_t n) { va_feed_after(0, b, n); }
 size_t va_pending(void) { return s_in_tail - s_in_head; }
-void va_clear_input(void) { s_in_head = s_in_tail = 0; }
+void va_clear_input(void) { s_in_head = s_in_tail = 0; s_now = s_last_at = 0; }
+uint32_t va_now(void) { return s_now; }
 
 static int vc_read(uint8_t *buf, size_t length, TickType_t ticks)
 {
-    (void)ticks;   /* an empty stream is a timeout, whatever the wait */
     size_t n = 0;
-    while (n < length && s_in_head < s_in_tail) buf[n++] = s_in[s_in_head++];
+    while (n < length) {
+        if (s_in_head == s_in_tail) {   /* nothing more will ever arrive */
+            if (ticks != portMAX_DELAY) s_now += ticks;
+            break;
+        }
+        const uint32_t at = s_at[s_in_head];
+        if (at > s_now) {
+            if (ticks != portMAX_DELAY && at - s_now > ticks) {   /* the wait ends before the byte arrives */
+                s_now += ticks;
+                break;
+            }
+            s_now = at;
+        }
+        buf[n++] = s_in[s_in_head++];
+    }
     return (int)n;
 }
-static int vc_write(const char *buf, size_t length, TickType_t ticks) { (void)buf; (void)ticks; return (int)length; }
+static int vc_write(const char *buf, size_t length, TickType_t ticks)
+{
+    (void)ticks;
+    if (length == 4 && memcmp(buf, "\n>>\n", 4) == 0) VA.prompts++;
+    vt_printf("%.*s", (int)length, buf);
+    return (int)length;
+}
 static esp_err_t vc_done(TickType_t ticks) { (void)ticks; return ESP_OK; }
 static ecu_console_interface_t s_console = {.read_bytes = vc_read, .write_bytes = vc_write, .wait_tx_done = vc_done};
 ecu_console_interface_t *get_console_interface(void) { return &s_console; }
