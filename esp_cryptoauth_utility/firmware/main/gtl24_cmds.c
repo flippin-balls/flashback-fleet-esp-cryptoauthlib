@@ -196,20 +196,23 @@ static esp_err_t write_slot_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len> [<crc32>]  (then <len> raw bytes + NUL)");
         return fail_stop("write-slot arguments: the payload length cannot be trusted");
     }
-    if (!ecu_cli_atecc_ready()) {
+    /* Not initialized or not, the frame is consumed whole and its CRC32 checked: a refusal must not leave a broken
+     * frame's late remainder to the console loop either (codex R1.1 on I9y7WaYU). */
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
         ESP_LOGE(TAG, "Please initialize device before calling this function");
-        if (!consume_frame(NULL, (size_t)len)) {
-            return fail_stop("write-slot payload");
-        }
-        return finish(ESP_ERR_INVALID_STATE);
+    } else {
+        printf("Reading %d bytes of data...\n", len);
+        fflush(stdout);
     }
-    printf("Reading %d bytes of data...\n", len);
-    fflush(stdout);
     if (!consume_frame(buf, (size_t)len)) {
         return fail_stop("write-slot payload");
     }
     if (have_crc && !crc32_matches(buf, (size_t)len, crc)) {
         return fail_stop("write-slot payload CRC32");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
     }
     return finish(atecc_write_slot(slot, offset, buf, (size_t)len, &err_code));
 }
@@ -267,20 +270,21 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
         ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15> [<crc32>]  (then 64 raw bytes X||Y + NUL)");
         return fail_stop("write-pubkey arguments");
     }
-    if (!ecu_cli_atecc_ready()) {
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
         ESP_LOGE(TAG, "Please initialize device before calling this function");
-        if (!consume_frame(NULL, sizeof pub)) {
-            return fail_stop("write-pubkey payload");
-        }
-        return finish(ESP_ERR_INVALID_STATE);
+    } else {
+        printf("Reading 64 bytes of data...\n");
+        fflush(stdout);
     }
-    printf("Reading 64 bytes of data...\n");
-    fflush(stdout);
     if (!consume_frame(pub, sizeof pub)) {
         return fail_stop("write-pubkey payload");
     }
     if (have_crc && !crc32_matches(pub, sizeof pub, crc)) {
         return fail_stop("write-pubkey payload CRC32");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
     }
     return finish(atecc_write_pubkey_slot(slot, pub, &err_code));
 }

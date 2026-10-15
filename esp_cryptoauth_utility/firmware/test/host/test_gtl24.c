@@ -605,11 +605,30 @@ static void test_crc(void)
               "\"%s\": halt before the payload is read", badpk[i]);
     }
 
-    /* Not initialized: the whole frame is consumed and refused; the CRC is not the question. */
+    /* Not initialized: the whole frame is consumed and its CRC32 still checked (codex R1.1 on I9y7WaYU) -- a refusal
+     * must not hand a broken frame's late remainder to the console loop either. */
     blank_v2();
     VA_CLI_READY = false;
+    run("write-slot 10 0 72 " CRC_REC_201, rec, 72, 1);
+    CHECK(failed() && !halted() && va_pending() == 0 && VA.atcab_calls == 0,
+          "not initialized, right CRC32: Failure, frame consumed, no halt");
+    run("write-slot 10 0 72", rec, 72, 1);
+    CHECK(failed() && !halted() && va_pending() == 0, "not initialized, no CRC32: Failure, frame consumed, no halt");
     run("write-slot 10 0 72 1", rec, 72, 1);
-    CHECK(failed() && !halted() && va_pending() == 0, "not initialized: Failure, frame consumed, no halt");
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "not initialized, wrong CRC32: halt");
+    reload();
+    run("write-pubkey 13 " CRC_PUB_202, pub, 64, 1);
+    CHECK(failed() && !halted() && va_pending() == 0, "not initialized, write-pubkey, right CRC32: Failure, no halt");
+    run("write-pubkey 13 1", pub, 64, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "not initialized, write-pubkey, wrong CRC32: halt");
+    reload();
+    feed_str_after(0, "write-slot 10 0 4 " CRC_R21 "\r");
+    feed_str_after(100, "ABCD");
+    va_feed(NUL1, 1);
+    feed_str_after(150, "lock-slot 11\r");
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && halted(),
+          "not initialized, R2.1's stream with the CRC32: the late suffix is never dispatched");
     VA_CLI_READY = true;
 
     /* codex R2.1 on #12, closed: a host sending "ABCD\0lock-slot 11\r" for a declared 4 bytes, the suffix arriving after
