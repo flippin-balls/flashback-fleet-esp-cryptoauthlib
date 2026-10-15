@@ -17,6 +17,13 @@
  * recovery boundary is a fresh stub. The real host always frames correctly, so this only ever fires on a transport
  * fault -- before an irreversible operation, which is exactly when stopping is right. Every read is bounded, so a host
  * that never sends the payload gets the Failure, not a stub that hangs.
+ *
+ * PAYLOAD CRC32 (Trello I9y7WaYU, step 1 of 3). write-slot and write-pubkey take an OPTIONAL last argument: the CRC32 of
+ * the payload, in decimal, exactly as write-config / program-dev-cert take theirs (zlib's crc32() on the host,
+ * esp_rom_crc32_le(0, ...) here). It binds the declared <len> to the bytes the host sent: a payload that is longer than
+ * declared fails the check even when its byte at <len> is 0x00 and the rest arrives after the quiet line -- the one
+ * case the framing alone cannot see (codex R2.1 on #12). A mismatch is a broken frame: the stub halts, before any chip
+ * call. Step 2: the host always sends it. Step 3: the stub requires it.
  */
 #include <errno.h>
 #include <stdbool.h>
@@ -30,6 +37,7 @@
 #include "esp_console.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 
 #include "ecu_console_interface.h"
 #include "gtl24.h"
@@ -141,27 +149,70 @@ static esp_err_t finish(esp_err_t ret)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
+/* The optional payload CRC32: a whole decimal token, digits only (strtoul would take "-1" as 4294967295), at most
+ * 4294967295. */
+static bool parse_crc32(const char *tok, uint32_t *out)
+{
+    if (tok == NULL || *tok == '\0') {
+        return false;
+    }
+    for (const char *p = tok; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long v = strtoull(tok, &end, 10);
+    if (errno != 0 || *end != '\0' || v > 0xFFFFFFFFull) {
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+/* The payload against the CRC32 the host sent for it. */
+static bool crc32_matches(const unsigned char *buf, size_t len, uint32_t expected)
+{
+    const uint32_t got = esp_rom_crc32_le(0, buf, (uint32_t)len);
+    if (got != expected) {
+        ESP_LOGE(TAG, "payload: CRC32 of the %u bytes is %lu, the host sent %lu (length or content mismatch)",
+                 (unsigned)len, (unsigned long)got, (unsigned long)expected);
+        return false;
+    }
+    return true;
+}
+
 static esp_err_t write_slot_cmd(int argc, char **argv)
 {
     static unsigned char buf[GTL24_MAX_WRITE];
     int err_code = 0;
     int slot, offset, len;
-    if (argc != 4 || !parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) ||
-        !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)) {
-        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len>  (then <len> raw bytes + NUL)");
+    uint32_t crc = 0;
+    const bool have_crc = (argc == 5);
+    if ((argc != 4 && argc != 5) || !parse_int(argv[1], 0, 15, &slot) ||
+        !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) || !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len) ||
+        (have_crc && !parse_crc32(argv[4], &crc))) {
+        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len> [<crc32>]  (then <len> raw bytes + NUL)");
         return fail_stop("write-slot arguments: the payload length cannot be trusted");
     }
-    if (!ecu_cli_atecc_ready()) {
+    /* Not initialized or not, the frame is consumed whole and its CRC32 checked: a refusal must not leave a broken
+     * frame's late remainder to the console loop either (codex R1.1 on I9y7WaYU). */
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
         ESP_LOGE(TAG, "Please initialize device before calling this function");
-        if (!consume_frame(NULL, (size_t)len)) {
-            return fail_stop("write-slot payload");
-        }
-        return finish(ESP_ERR_INVALID_STATE);
+    } else {
+        printf("Reading %d bytes of data...\n", len);
+        fflush(stdout);
     }
-    printf("Reading %d bytes of data...\n", len);
-    fflush(stdout);
     if (!consume_frame(buf, (size_t)len)) {
         return fail_stop("write-slot payload");
+    }
+    if (have_crc && !crc32_matches(buf, (size_t)len, crc)) {
+        return fail_stop("write-slot payload CRC32");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
     }
     return finish(atecc_write_slot(slot, offset, buf, (size_t)len, &err_code));
 }
@@ -213,21 +264,27 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
     unsigned char pub[64];
     int err_code = 0;
     int slot;
-    if (argc != 2 || !parse_int(argv[1], 8, 15, &slot)) {
-        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15>  (then 64 raw bytes X||Y + NUL)");
+    uint32_t crc = 0;
+    const bool have_crc = (argc == 3);
+    if ((argc != 2 && argc != 3) || !parse_int(argv[1], 8, 15, &slot) || (have_crc && !parse_crc32(argv[2], &crc))) {
+        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15> [<crc32>]  (then 64 raw bytes X||Y + NUL)");
         return fail_stop("write-pubkey arguments");
     }
-    if (!ecu_cli_atecc_ready()) {
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
         ESP_LOGE(TAG, "Please initialize device before calling this function");
-        if (!consume_frame(NULL, sizeof pub)) {
-            return fail_stop("write-pubkey payload");
-        }
-        return finish(ESP_ERR_INVALID_STATE);
+    } else {
+        printf("Reading 64 bytes of data...\n");
+        fflush(stdout);
     }
-    printf("Reading 64 bytes of data...\n");
-    fflush(stdout);
     if (!consume_frame(pub, sizeof pub)) {
         return fail_stop("write-pubkey payload");
+    }
+    if (have_crc && !crc32_matches(pub, sizeof pub, crc)) {
+        return fail_stop("write-pubkey payload CRC32");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
     }
     return finish(atecc_write_pubkey_slot(slot, pub, &err_code));
 }
@@ -251,7 +308,8 @@ esp_err_t register_gtl24_commands(void)
 {
     const esp_console_cmd_t cmds[] = {
         {.command = "write-slot",
-         .help = "Write <len> raw bytes at <offset> of a data slot\n  Usage: write-slot <slot> <offset> <len>",
+         .help = "Write <len> raw bytes at <offset> of a data slot, optionally CRC32-checked (decimal, as write-config)\n"
+                 "  Usage: write-slot <slot> <offset> <len> [<crc32>]",
          .func = &write_slot_cmd},
         {.command = "read-slot",
          .help = "Read <len> bytes from the start of a data slot (clear-readable slots, after the data lock)\n"
@@ -261,7 +319,8 @@ esp_err_t register_gtl24_commands(void)
          .help = "Individually lock a Lockable data slot (IRREVERSIBLE; after the data lock)\n  Usage: lock-slot <slot>",
          .func = &lock_slot_cmd},
         {.command = "write-pubkey",
-         .help = "Write a P-256 public key (64 bytes X||Y) to slot 8-15 in stored format\n  Usage: write-pubkey <slot>",
+         .help = "Write a P-256 public key (64 bytes X||Y) to slot 8-15 in stored format, optionally CRC32-checked\n"
+                 "  Usage: write-pubkey <slot> [<crc32>]",
          .func = &write_pubkey_cmd},
         {.command = "sleep",
          .help = "Put the ATECC to sleep; the next command runs after a wake\n  Usage: sleep",
