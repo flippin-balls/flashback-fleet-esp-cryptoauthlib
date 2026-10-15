@@ -12,6 +12,7 @@
 
 #include "ecu_console_interface.h"
 #include "esp_console.h"
+#include "esp_rom_crc.h"
 #include "gtl24.h"
 #include "virtual_atecc.h"
 
@@ -381,7 +382,7 @@ static void test_bad_arguments(void)
     uint8_t rec[72];
     fill(rec, 72, 21);
     const char *bad[] = {"write-slot 10 0", "write-slot 10junk 0 72", "write-slot 16 0 72", "write-slot -1 0 72",
-                         "write-slot 10 0 0", "write-slot 10 0 417", "write-slot 10 x 72", "write-slot 10 0 72 9",
+                         "write-slot 10 0 0", "write-slot 10 0 417", "write-slot 10 x 72", "write-slot 10 0 72 9 9",
                          "write-slot 10 0 99999999999999999999"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         blank_v2();
@@ -403,7 +404,7 @@ static void test_bad_arguments(void)
     CHECK(failed() && VA.block_writes + VA.word_writes == 0, "past the end of a 72-byte slot refused");
     run("write-slot 10 64 8", rec, 8, 1);
     CHECK(ok() && memcmp(&VA.data[10][64], rec, 8) == 0, "the slot's last word is reachable");
-    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1", "write-pubkey 16", "write-pubkey 13x", "write-pubkey 7"};
+    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1 1", "write-pubkey 16", "write-pubkey 13x", "write-pubkey 7"};
     uint8_t pub[64];
     fill(pub, 64, 1);
     for (size_t i = 0; i < sizeof badpk / sizeof badpk[0]; i++) {
@@ -549,6 +550,93 @@ static void test_sleep(void)
     CHECK(ok() && !VA.asleep && VA.wakes == 1, "the next command runs after a wake");
 }
 
+/* I9y7WaYU step 1: the optional payload CRC32, decimal, zlib's crc32(). The constants below were computed with Python's
+ * zlib.crc32(), independently of the shim the stub links against. */
+#define CRC_REC_201 "3954926006"   /* zlib.crc32(fill(72, 201)) */
+#define CRC_PUB_202 "1410416443"   /* zlib.crc32(fill(64, 202)) */
+#define CRC_R21     "130108043"    /* zlib.crc32(b"ABCD\0lock-slot 11\r"): what a host sending that payload computes */
+static void test_crc(void)
+{
+    static const uint8_t check[] = "123456789";
+    CHECK(esp_rom_crc32_le(0, check, 9) == 0xCBF43926u, "the CRC is the standard CRC-32 (check value)");
+    uint8_t rec[72], pub[64];
+    fill(rec, 72, 201);
+    fill(pub, 64, 202);
+
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    run("write-slot 10 0 72 " CRC_REC_201, rec, 72, 1);
+    CHECK(ok() && !halted() && memcmp(VA.data[10], rec, 72) == 0, "write-slot with the right CRC32: written");
+    VA.atcab_calls = 0;
+    run("write-slot 11 0 72 3954926007", rec, 72, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "CRC32 of the 72 bytes is 3954926006"),
+          "a wrong CRC32: Failure and halt before any chip call, and it says why: %s", vt_captured());
+    reload();
+    run("write-slot 11 0 72 0003954926006", rec, 72, 1);
+    CHECK(ok() && memcmp(VA.data[11], rec, 72) == 0, "leading zeros are still the same decimal number");
+    run("write-slot 12 0 72", rec, 72, 1);
+    CHECK(ok() && memcmp(VA.data[12], rec, 72) == 0, "no CRC32: accepted as before (step 1 keeps the old host working)");
+    const char *bad[] = {"write-slot 10 0 72 12x", "write-slot 10 0 72 -1", "write-slot 10 0 72 +5",
+                         "write-slot 10 0 72 0x1F", "write-slot 10 0 72 4294967296", "write-slot 10 0 72 1 2"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        reload();
+        run(bad[i], rec, 72, 1);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading"),
+              "\"%s\": a CRC32 that is not a whole decimal u32 halts before the payload is read", bad[i]);
+    }
+    reload();
+    run("write-slot 10 0 72 4294967295", rec, 72, 1);
+    CHECK(halted() && strstr(vt_captured(), "Reading") && strstr(vt_captured(), "the host sent 4294967295"),
+          "4294967295 is a valid CRC32 argument (it parses; this payload's CRC just differs)");
+
+    blank_v2();
+    va_lock_config();
+    run("write-pubkey 13 " CRC_PUB_202, pub, 64, 1);
+    CHECK(ok() && !halted() && memcmp(&VA.data[13][4], pub, 32) == 0, "write-pubkey with the right CRC32: written");
+    VA.atcab_calls = 0;
+    run("write-pubkey 15 1410416442", pub, 64, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "write-pubkey with a wrong CRC32: halt before any chip call");
+    const char *badpk[] = {"write-pubkey 13 x", "write-pubkey 13 +1", "write-pubkey 13 1 2"};
+    for (size_t i = 0; i < sizeof badpk / sizeof badpk[0]; i++) {
+        reload();
+        run(badpk[i], pub, 64, 1);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading"),
+              "\"%s\": halt before the payload is read", badpk[i]);
+    }
+
+    /* Not initialized: the whole frame is consumed and refused; the CRC is not the question. */
+    blank_v2();
+    VA_CLI_READY = false;
+    run("write-slot 10 0 72 1", rec, 72, 1);
+    CHECK(failed() && !halted() && va_pending() == 0, "not initialized: Failure, frame consumed, no halt");
+    VA_CLI_READY = true;
+
+    /* codex R2.1 on #12, closed: a host sending "ABCD\0lock-slot 11\r" for a declared 4 bytes, the suffix arriving after
+     * the quiet line. Its CRC32 is over everything it sent, so the stub's CRC over 4 bytes differs: halt. */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    feed_str_after(0, "write-slot 10 0 4 " CRC_R21 "\r");
+    feed_str_after(100, "ABCD");
+    va_feed(NUL1, 1);
+    feed_str_after(150, "lock-slot 11\r");
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && VA.atcab_calls == 0 && halted(),
+          "R2.1 with the CRC32: the late \"lock-slot 11\" is never dispatched, nothing written: %s", vt_captured());
+    /* ... and without it, the residual this card exists for (step 3 makes the CRC32 mandatory). */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    feed_str_after(0, "write-slot 10 0 4\r");
+    feed_str_after(100, "ABCD");
+    va_feed(NUL1, 1);
+    feed_str_after(150, "lock-slot 11\r");
+    va_feed(NUL1, 1);
+    CHECK(session() == 2 && va_slot_locked(11),
+          "R2.1 WITHOUT the CRC32: the late suffix still runs -- why step 3 makes the CRC32 mandatory");
+}
+
 int main(void)
 {
     hex2bin(TEMPLATE_V2_HEX, TEMPLATE_V2, 128);
@@ -566,6 +654,7 @@ int main(void)
     test_session();
     test_handlers_direct();
     test_sleep_failure();
+    test_crc();
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

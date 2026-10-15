@@ -31,6 +31,18 @@ M = [
   (C, "uninitialised broken write-slot frame tolerated", "        if (!consume_frame(NULL, (size_t)len)) {\n            return fail_stop(\"write-slot payload\");\n        }", "        (void)consume_frame(NULL, (size_t)len);"),
   (C, "uninitialised broken write-pubkey frame tolerated", "        if (!consume_frame(NULL, sizeof pub)) {\n            return fail_stop(\"write-pubkey payload\");\n        }", "        (void)consume_frame(NULL, sizeof pub);"),
   (C, "write-slot writes a broken frame", "    if (!consume_frame(buf, (size_t)len)) {\n        return fail_stop(\"write-slot payload\");\n    }", "    (void)consume_frame(buf, (size_t)len);"),
+  (C, "CRC never checked (write-slot)",  "    if (have_crc && !crc32_matches(buf, (size_t)len, crc)) {", "    if (0) {"),
+  (C, "CRC never checked (write-pubkey)", "    if (have_crc && !crc32_matches(pub, sizeof pub, crc)) {", "    if (0) {"),
+  (C, "CRC mismatch tolerated",          "                 (unsigned)len, (unsigned long)got, (unsigned long)expected);\n        return false;", "                 (unsigned)len, (unsigned long)got, (unsigned long)expected);"),
+  (C, "CRC over one byte less",          "esp_rom_crc32_le(0, buf, (uint32_t)len)", "esp_rom_crc32_le(0, buf, (uint32_t)len - 1u)"),
+  (C, "CRC argument ignored (write-slot)", "const bool have_crc = (argc == 5);", "const bool have_crc = false;"),
+  (C, "CRC argument ignored (write-pubkey)", "const bool have_crc = (argc == 3);", "const bool have_crc = false;"),
+  (C, "malformed CRC accepted",          "(have_crc && !parse_crc32(argv[4], &crc))) {", "(have_crc && !parse_crc32(argv[4], &crc) && 0)) {"),
+  (C, "plus sign accepted",              "        if (*p < '0' || *p > '9') {", "        if ((*p < '0' || *p > '9') && *p != '+') {"),
+  (C, "CRC wider than 32 bits accepted", "v > 0xFFFFFFFFull", "v > 0x1FFFFFFFFull"),
+  (C, "CRC upper bound exclusive",       "v > 0xFFFFFFFFull", "v >= 0xFFFFFFFFull"),
+  (C, "write-slot argc 6 accepted",      "if ((argc != 4 && argc != 5) ||", "if ((argc < 4) ||"),
+  (C, "write-pubkey argc 4 accepted",    "if ((argc != 2 && argc != 3) ||", "if ((argc < 2) ||"),
   (C, "write-pubkey writes a broken frame", "    if (!consume_frame(pub, sizeof pub)) {\n        return fail_stop(\"write-pubkey payload\");\n    }", "    (void)consume_frame(pub, sizeof pub);"),
   # parsing and readiness (gtl24_cmds.c)
   (C, "parse accepts trailing junk",     "end == tok || *end != '\\0' ||", "end == tok ||"),
@@ -38,7 +50,6 @@ M = [
   (C, "parse ignores the lower bound",   "v < lo || v > hi)", "(v < lo && 0) || v > hi)"),
   # (not listed: dropping the errno test is EQUIVALENT -- every bound here is far below LONG_MAX, so an overflowed
   #  strtol result is out of range either way)
-  (C, "write-slot argc unchecked",       "    if (argc != 4 || !parse_int(argv[1], 0, 15, &slot)", "    if (argc < 4 || !parse_int(argv[1], 0, 15, &slot)"),
   (C, "write-slot len 0 allowed",        "!parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)", "!parse_int(argv[3], 0, GTL24_MAX_WRITE, &len)"),
   (C, "write-pubkey slot 7 allowed",     "!parse_int(argv[1], 8, 15, &slot)", "!parse_int(argv[1], 7, 15, &slot)"),
   (C, "write-slot readiness unchecked",  "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        if (!consume_frame(NULL, (size_t)len)) {\n            return fail_stop(\"write-slot payload\");\n        }\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n", ""),
