@@ -414,18 +414,20 @@ static void test_bad_arguments(void)
 {
     uint8_t rec[72];
     fill(rec, 72, 21);
-    /* each with a well-formed CRC32 argument, so the rule refusing it is the one named (step 3: a missing CRC32 halts
-     * on its own -- test_crc) */
-    const char *bad[] = {"write-slot 10 0", "write-slot 10junk 0 72 1", "write-slot 16 0 72 1", "write-slot -1 0 72 1",
-                         "write-slot 10 0 0 1", "write-slot 10 0 417 1", "write-slot 10 x 72 1", "write-slot 10 0 72 9 9",
-                         "write-slot 10 0 99999999999999999999 1"};
+    /* each with the CRC32 of the 72 bytes that follow, so that only the argument rule can refuse it, and the reason
+     * printed is checked (codex R1.1 on I9y7WaYU step 3; a missing CRC32 halts on its own -- test_crc) */
+    const char *bad[] = {"write-slot 10 0", "write-slot 10junk 0 72", "write-slot 16 0 72", "write-slot -1 0 72",
+                         "write-slot 10 0 0", "write-slot 10 0 417", "write-slot 10 x 72", "write-slot 10 0 72 9 9",
+                         "write-slot 10 0 99999999999999999999"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         blank_v2();
         va_lock_config();
         va_lock_data();
-        run(bad[i], rec, 72, 1);
-        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
-              "\"%s\": the payload length cannot be trusted -- Failure and halt before reading it, no chip call", bad[i]);
+        run(i == 0 || i == 7 ? bad[i] : crcl(bad[i], rec, 72), rec, 72, 1);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL &&
+                  strstr(vt_captured(), "FRAMING ERROR (write-slot arguments: the payload length cannot be trusted)"),
+              "\"%s\": the payload length cannot be trusted -- Failure and halt before reading it, no chip call: %s", bad[i],
+              vt_captured());
     }
     blank_v2();
     va_lock_config();
@@ -439,16 +441,16 @@ static void test_bad_arguments(void)
     CHECK(failed() && VA.block_writes + VA.word_writes == 0, "past the end of a 72-byte slot refused");
     run(crcl("write-slot 10 64 8", rec, 8), rec, 8, 1);
     CHECK(ok() && memcmp(&VA.data[10][64], rec, 8) == 0, "the slot's last word is reachable");
-    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1 1", "write-pubkey 16 1", "write-pubkey 13x 1",
-                           "write-pubkey 7 1"};
+    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1 1", "write-pubkey 16", "write-pubkey 13x", "write-pubkey 7"};
     uint8_t pub[64];
     fill(pub, 64, 1);
     for (size_t i = 0; i < sizeof badpk / sizeof badpk[0]; i++) {
         blank_v2();
         va_lock_config();
-        run(badpk[i], pub, 64, 1);
-        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL,
-              "\"%s\": Failure and halt before reading the payload, no chip call", badpk[i]);
+        run(i < 2 ? badpk[i] : crcl(badpk[i], pub, 64), pub, 64, 1);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "Reading") == NULL &&
+                  strstr(vt_captured(), "FRAMING ERROR (write-pubkey arguments)"),
+              "\"%s\": Failure and halt before reading the payload, no chip call: %s", badpk[i], vt_captured());
     }
     const char *badno[] = {"read-slot 10", "read-slot 10 0", "read-slot 10 73", "read-slot 17 72", "lock-slot",
                            "lock-slot 10junk", "lock-slot 16", "sleep now"};
