@@ -57,6 +57,11 @@ for f in ("commands.c", "handlers.c", "handlers.h"):
             bad.append("%s still carries %s (the commands live in gtl24_*.c)" % (f, name))
     if re.search(r"\batecc_(write_slot|read_slot|lock_slot|write_pubkey_slot|sleep)\s*\(", src(f)):
         bad.append("%s still carries a GTL 24 atecc_* function (they live in gtl24_slots.c)" % f)
+# app_main.c scli_loop (not host-built): a line whose first byte is a NUL must not write linebuf[-1] (I9y7WaYU).
+loop = src("app_main.c")
+if "strlen((char *)linebuf) - 1" in loop or len(re.findall(
+        r"const size_t n = strlen\(\(char \*\)linebuf\);\s*\n\s*if \(n > 0\) \{\s*\n\s*linebuf\[n - 1\] = '\\0';", loop)) != 1:
+    bad.append("app_main.c: the console loop must drop the last character only when the line is not empty")
 for b in bad:
     print("SOURCE ASSERT: " + b)
 sys.exit(1 if bad else 0)

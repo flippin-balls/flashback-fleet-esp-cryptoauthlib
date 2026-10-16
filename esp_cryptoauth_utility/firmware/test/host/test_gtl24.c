@@ -92,8 +92,7 @@ static int session(void)
             i++;
         } while (i < 1023 && line[i - 1] != '\r');
         const size_t len = strlen(line);
-        if (len == 0) continue;   /* (the target writes linebuf[-1] here -- pre-existing; no stream below reaches it) */
-        line[len - 1] = '\0';
+        if (len > 0) line[len - 1] = '\0';   /* app_main.c's guard (I9y7WaYU): a leading NUL is an empty line */
         lines++;
         char *argv[8];
         int argc = 0;
