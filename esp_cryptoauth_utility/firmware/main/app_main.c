@@ -91,7 +91,12 @@ static void scli_loop() {
             ESP_LOGE(TAG, "Failed to wait for TX done");
             continue;
         }
-        linebuf[strlen((char *)linebuf) - 1] = '\0';
+        /* Drop the line's last character (its '\r'). A line whose first byte is a NUL has length 0 and nothing to drop:
+         * this used to write linebuf[-1] (Trello I9y7WaYU). esp_console_run() then runs nothing for the empty line. */
+        const size_t n = strlen((char *)linebuf);
+        if (n > 0) {
+            linebuf[n - 1] = '\0';
+        }
 
         esp_console_run((char *)linebuf, &cmd_ret);
     }
