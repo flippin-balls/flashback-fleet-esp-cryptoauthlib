@@ -52,7 +52,7 @@ if cmds.count("GTL24_HOST_TEST") != 1:
 if len(re.findall(r"\bregister_gtl24_commands\(\)", src("commands.c"))) != 1:
     bad.append("commands.c must call register_gtl24_commands() exactly once")
 for f in ("commands.c", "handlers.c", "handlers.h"):
-    for name in ('"write-slot"', '"read-slot"', '"lock-slot"', '"write-pubkey"'):
+    for name in ('"write-slot"', '"read-slot"', '"lock-slot"', '"write-pubkey"', '"write-data"'):
         if name in src(f):
             bad.append("%s still carries %s (the commands live in gtl24_*.c)" % (f, name))
     if re.search(r"\batecc_(write_slot|read_slot|lock_slot|write_pubkey_slot|sleep)\s*\(", src(f)):

@@ -149,11 +149,23 @@ static void feed_crcl_after(uint32_t gap_ms, const char *line, const uint8_t *pa
     feed_str_after(gap_ms, l);
 }
 
+/* handlers.c's atecc_write_data is not host-built: write-data's chip call is recorded here (and counted as a chip call). */
+static struct { int calls, slot, fail; uint8_t data[32]; } WD;
+esp_err_t atecc_write_data(int slot, unsigned char *data_buf, size_t data_len, int *err_ret)
+{
+    VA.atcab_calls++;
+    WD.calls++;
+    WD.slot = slot;
+    if (data_len == sizeof WD.data) memcpy(WD.data, data_buf, sizeof WD.data);
+    *err_ret = WD.fail ? 0xE0 : 0;
+    return (WD.fail || data_len != sizeof WD.data) ? ESP_FAIL : ESP_OK;
+}
+
 static void test_registration(void)
 {
-    const char *names[] = {"write-slot", "read-slot", "lock-slot", "write-pubkey", "sleep"};
-    for (int i = 0; i < 5; i++) CHECK(find(names[i]) != NULL, "%s registered", names[i]);
-    CHECK(vt_ncmds == 5, "exactly the five commands (%d)", vt_ncmds);
+    const char *names[] = {"write-slot", "read-slot", "lock-slot", "write-pubkey", "sleep", "write-data"};
+    for (int i = 0; i < 6; i++) CHECK(find(names[i]) != NULL, "%s registered", names[i]);
+    CHECK(vt_ncmds == 6, "exactly the six commands (%d)", vt_ncmds);
 }
 
 /* The bench flow's order: config locked, trust anchors 13-15, data lock, the record 10-12, read back, slot locks. */
@@ -716,6 +728,98 @@ static void test_help_probe(void)
     CHECK(strstr(ws, "REQUIRED") != NULL && strstr(wp, "REQUIRED") != NULL, "and both say the CRC32 is required");
 }
 
+/* write-data (moved from commands.c, I9y7WaYU): the slot-6 io key's 32 bytes frame like write-slot's. The key below
+ * carries "\rlock-slot 11\r": a refusal that left it to the console loop would lock slot 11. */
+static void wd_key(uint8_t *k)
+{
+    fill(k, 32, 61);
+    memcpy(&k[8], "\rlock-slot 11\r", 14);
+}
+static void wd_reset(void) { blank_v2(); va_lock_config(); memset(&WD, 0, sizeof WD); }
+
+static void test_write_data(void)
+{
+    uint8_t key[32];
+    wd_key(key);
+    wd_reset();
+    run("write-data 6", key, 32, 1);
+    CHECK(ok() && !halted() && va_pending() == 0 && WD.calls == 1 && WD.slot == 6 && memcmp(WD.data, key, 32) == 0 &&
+              strstr(vt_captured(), "Reading 32 bytes"),
+          "write-data 6: the 32 bytes, NULs and CRs included, reach the chip call: %s", vt_captured());
+
+    const char *bad[] = {"write-data", "write-data 6 7", "write-data 6x", "write-data 16", "write-data -1", "write-data x"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        wd_reset();
+        run(bad[i], key, 32, 1);
+        CHECK(failed() && halted() && WD.calls == 0 && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading"),
+              "\"%s\": Failure and halt before the payload is read, no chip call", bad[i]);
+    }
+    /* the card's case through the console loop: bad arguments, then the key -- which must never run as a command */
+    wd_reset();
+    feed_str_after(0, "write-data\r");
+    va_feed_after(100, key, 32);
+    va_feed(NUL1, 1);
+    CHECK(session() == 1 && !va_slot_locked(11) && WD.calls == 0 && halted(),
+          "write-data with bad arguments: its payload is never dispatched: %s", vt_captured());
+
+    /* not initialized: the frame is consumed whole, Failure, and the host's next line is the next command */
+    wd_reset();
+    VA_CLI_READY = false;
+    run("write-data 6", key, 32, 1);
+    CHECK(failed() && !halted() && va_pending() == 0 && WD.calls == 0, "write-data before init: Failure, frame consumed");
+    wd_reset();
+    va_lock_data();
+    VA_CLI_READY = false;
+    feed_str_after(0, "write-data 6\r");
+    va_feed_after(100, key, 32);
+    va_feed(NUL1, 1);
+    feed_str_after(300, "sleep\r");
+    CHECK(session() == 2 && !halted() && !va_slot_locked(11) && WD.calls == 0 && count(vt_captured(), "Status: Failure") == 2,
+          "write-data before init through the loop: the key is consumed, then the host's next command: %s", vt_captured());
+    VA_CLI_READY = true;
+
+    /* broken frames halt before the chip call */
+    wd_reset();
+    run("write-data 6", key, 31, 0);
+    CHECK(failed() && halted() && WD.calls == 0 && strstr(vt_captured(), "got 31 of 32"), "a short key: halt, no write");
+    wd_reset();
+    run("write-data 6", key, 32, 0);
+    CHECK(failed() && halted() && WD.calls == 0 && strstr(vt_captured(), "no NUL terminator"), "no NUL: halt, no write");
+    uint8_t longer[36];
+    memcpy(longer, key, 32);
+    longer[32] = 0x41;
+    memset(&longer[33], 0, 3);
+    wd_reset();
+    run("write-data 6", longer, 36, 1);
+    CHECK(failed() && halted() && WD.calls == 0 && strstr(vt_captured(), "not the NUL terminator"),
+          "a wrong terminator (a long key): halt, no write");
+    longer[32] = 0x00;
+    wd_reset();
+    run("write-data 6", longer, 36, 1);
+    CHECK(failed() && halted() && WD.calls == 0 && strstr(vt_captured(), "more input after"),
+          "a long key with 0x00 at byte 32: halt, no write");
+    /* the old handler's worst case: a short key, then the host's next command, which it read as key bytes */
+    wd_reset();
+    feed_str_after(0, "write-data 6\r");
+    va_feed_after(100, key, 20);
+    feed_str_after(1500, "lock-slot 11\r");
+    CHECK(session() == 1 && halted() && WD.calls == 0 && !va_slot_locked(11),
+          "a key that stalls short: halt; the next command is neither written as key bytes nor run: %s", vt_captured());
+    wd_reset();
+    va_feed_after(4900, key, 32);
+    va_feed(NUL1, 1);
+    call("write-data 6");
+    CHECK(ok() && WD.calls == 1, "the first key byte may take 4.9 s, as for write-slot");
+
+    /* the chip refuses: Failure, the reason after the Status line, no halt */
+    wd_reset();
+    WD.fail = 1;
+    run("write-data 6", key, 32, 1);
+    const char *st = strstr(vt_captured(), "Status: Failure");
+    const char *why = strstr(vt_captured(), "Writing data failed, returned 224");
+    CHECK(failed() && !halted() && WD.calls == 1 && st && why && st < why, "a chip refusal: %s", vt_captured());
+}
+
 int main(void)
 {
     hex2bin(TEMPLATE_V2_HEX, TEMPLATE_V2, 128);
@@ -735,6 +839,7 @@ int main(void)
     test_sleep_failure();
     test_crc();
     test_help_probe();
+    test_write_data();
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

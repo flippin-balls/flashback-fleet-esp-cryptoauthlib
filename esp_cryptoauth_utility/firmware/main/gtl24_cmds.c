@@ -304,6 +304,41 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
     return finish(atecc_write_pubkey_slot(slot, pub, &err_code));
 }
 
+/* write-data <slot>, then 32 raw bytes + NUL: the 32-byte data write dcm uses for the slot-6 io protection key, before
+ * the data lock. Moved from commands.c (Trello I9y7WaYU) to frame like the commands above. There it read the payload with
+ * no timeout and never checked the terminator, so a short payload took the host's next command line as key bytes; and a
+ * refusal (bad arguments, not initialized) left the 32 bytes to the console loop as a command line. No CRC32: dcm sends
+ * "write-data <slot>" alone, and adding one would be a new wire. The command line, help and Status output are as before. */
+static esp_err_t write_data_cmd(int argc, char **argv)
+{
+    unsigned char data[32];
+    int err_code = 0;
+    int slot;
+    if (argc != 2 || !parse_int(argv[1], 0, 15, &slot)) {
+        ESP_LOGE(TAG, "Invalid arguments. Expected: write-data <slot>  (then 32 raw bytes + NUL)");
+        return fail_stop("write-data arguments");
+    }
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
+        ESP_LOGE(TAG, "Please initialize device before calling this function");
+    } else {
+        printf("Reading 32 bytes of data...\n");
+        fflush(stdout);
+    }
+    if (!consume_frame(data, sizeof data)) {
+        return fail_stop("write-data payload");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
+    }
+    const esp_err_t ret = atecc_write_data(slot, data, sizeof data, &err_code);
+    finish(ret);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Writing data failed, returned %d", err_code);
+    }
+    return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t sleep_cmd(int argc, char **argv)
 {
     (void)argv;
@@ -339,6 +374,13 @@ esp_err_t register_gtl24_commands(void)
                  "REQUIRED\n"
                  "  Usage: write-pubkey <slot> [<crc32>]",
          .func = &write_pubkey_cmd},
+        {.command = "write-data",
+         .help = "Write 32 bytes of data to a slot\n"
+                 "  Data zone must be UNLOCKED for most slots\n"
+                 "  Usage: write-data <slot>\n"
+                 "  Example: write-data 6\n"
+                 "  Note: Follow command with 32 bytes of data",
+         .func = &write_data_cmd},
         {.command = "sleep",
          .help = "Put the ATECC to sleep; the next command runs after a wake\n  Usage: sleep",
          .func = &sleep_cmd},

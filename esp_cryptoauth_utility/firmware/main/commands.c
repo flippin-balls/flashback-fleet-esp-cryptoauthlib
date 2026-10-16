@@ -62,7 +62,6 @@ static esp_err_t register_is_config_locked();
 static esp_err_t register_is_data_locked();
 static esp_err_t register_lock_config_zone();
 static esp_err_t register_lock_data_zone();
-static esp_err_t register_write_data();
 static esp_err_t register_write_enc_data();
 static esp_err_t register_generate_location_psk();
 static device_status_t atca_cli_status_object;
@@ -83,7 +82,6 @@ esp_err_t register_command_handler()
     ret |= register_is_data_locked();
     ret |= register_lock_config_zone();
     ret |= register_lock_data_zone();
-    ret |= register_write_data();
     ret |= register_generate_location_psk();
     ret |= register_write_enc_data();
     ret |= register_gtl24_commands();
@@ -821,77 +819,6 @@ static esp_err_t register_read_config()
                     "  Usage: read-config\n"
                     "  Example: read-config",
             .func = &read_config,
-    };
-    return esp_console_cmd_register(&cmd);
-}
-
-static esp_err_t write_data(int argc, char **argv)
-{
-    esp_err_t ret = ESP_ERR_INVALID_ARG;
-    int err_code;
-    uint8_t data_buf[32];
-    int slot;
-    uint32_t expected_crc;
-
-    if (atca_cli_status_object >= ATECC_INIT_SUCCESS) {
-        if (argc == 2) {
-            slot = atoi(argv[1]);
-
-            // Get CRC32 checksum
-            expected_crc = strtoul(argv[1], NULL, 10);
-
-            // Actually parse slot from argv[1]
-            expected_crc = strtoul(argv[1], NULL, 10);
-            slot = expected_crc; // First arg is slot number
-
-            printf("Reading 32 bytes of data...\n");
-            fflush(stdout);
-
-            // Read 32 bytes via UART
-            ecu_console_interface_t *console_interface = get_console_interface();
-            for (int i = 0; i < 32; i++) {
-                int read_ret = console_interface->read_bytes(&data_buf[i], 1, portMAX_DELAY);
-                if (read_ret <= 0) {
-                    ESP_LOGE(TAG, "Failed to read byte %d", i);
-                    ret = ESP_FAIL;
-                    goto end;
-                }
-            }
-
-            // Read null terminator
-            uint8_t null_term;
-            console_interface->read_bytes(&null_term, 1, portMAX_DELAY);
-
-            ret = atecc_write_data(slot, data_buf, 32, &err_code);
-        } else {
-            ESP_LOGE(TAG, "Invalid arguments. Expected: write-data <slot>");
-        }
-
-        ESP_LOGI(TAG, "Status: %s\n", ret ? "Failure" : "Success");
-    }
-
-end:
-    if (atca_cli_status_object < ATECC_INIT_SUCCESS) {
-        ESP_LOGE(TAG, "Please initialize device before calling this function");
-    } else if (ret == ESP_ERR_INVALID_ARG) {
-        ESP_LOGE(TAG, "Reason: Invalid Usage");
-    } else if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Writing data failed, returned %d", err_code);
-    }
-    fflush(stdout);
-    return ESP_OK;
-}
-
-static esp_err_t register_write_data()
-{
-    const esp_console_cmd_t cmd = {
-            .command = "write-data",
-            .help = "Write 32 bytes of data to a slot\n"
-                    "  Data zone must be UNLOCKED for most slots\n"
-                    "  Usage: write-data <slot>\n"
-                    "  Example: write-data 6\n"
-                    "  Note: Follow command with 32 bytes of data",
-            .func = &write_data,
     };
     return esp_console_cmd_register(&cmd);
 }
