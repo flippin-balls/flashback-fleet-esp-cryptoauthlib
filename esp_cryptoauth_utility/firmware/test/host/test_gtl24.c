@@ -130,6 +130,26 @@ static void fill(uint8_t *b, size_t n, unsigned seed)
     b[0] = 0x00; b[n / 2] = 0x00;   /* binary payloads carry NULs: framing is by length, never by NUL */
 }
 
+/* "<line> <crc32>": the CRC32 a host computes over the n bytes it sends (I9y7WaYU step 3: required on write-slot and
+ * write-pubkey). This uses the shim's CRC, which test_crc pins to the standard check value; test_crc's own constants
+ * come from Python's zlib, independently of it. */
+static const char *crcl(const char *line, const uint8_t *payload, size_t n)
+{
+    static char out[2][128];
+    static int k;
+    k ^= 1;
+    snprintf(out[k], sizeof out[k], "%s %lu", line, (unsigned long)esp_rom_crc32_le(0, payload, (uint32_t)n));
+    return out[k];
+}
+
+/* The same, CR-terminated, for a console-loop stream. */
+static void feed_crcl_after(uint32_t gap_ms, const char *line, const uint8_t *payload, size_t n)
+{
+    char l[160];
+    snprintf(l, sizeof l, "%s\r", crcl(line, payload, n));
+    feed_str_after(gap_ms, l);
+}
+
 static void test_registration(void)
 {
     const char *names[] = {"write-slot", "read-slot", "lock-slot", "write-pubkey", "sleep"};
@@ -147,7 +167,7 @@ static void test_template_v2_flow(void)
         fill(pub[k], 64, 11u * (unsigned)k + 1u);
         char line[32];
         snprintf(line, sizeof line, "write-pubkey %d", 13 + k);
-        run(line, pub[k], 64, 1);
+        run(crcl(line, pub[k], 64), pub[k], 64, 1);
         CHECK(ok() && va_pending() == 0, "write-pubkey %d before the data lock: %s", 13 + k, vt_captured());
         uint8_t stored[72] = {0};
         memcpy(&stored[4], pub[k], 32);
@@ -162,7 +182,7 @@ static void test_template_v2_flow(void)
         fill(rec[k], 72, 101u + (unsigned)k);
         char line[32];
         snprintf(line, sizeof line, "write-slot %d 0 72", 10 + k);
-        run(line, rec[k], 72, 1);
+        run(crcl(line, rec[k], 72), rec[k], 72, 1);
         CHECK(ok() && va_pending() == 0, "write-slot %d after the data lock: %s", 10 + k, vt_captured());
         CHECK(memcmp(VA.data[10 + k], rec[k], 72) == 0, "slot %d holds the record bytes, NULs included", 10 + k);
     }
@@ -185,7 +205,7 @@ static void test_template_v2_flow(void)
     }
     run("lock-slot 10", NULL, 0, 0);
     CHECK(failed(), "a second lock of the same slot fails");
-    run("write-slot 10 0 72", rec[0], 72, 1);
+    run(crcl("write-slot 10 0 72", rec[0], 72), rec[0], 72, 1);
     CHECK(failed() && va_pending() == 0, "a locked record slot refuses a write");
     CHECK(!halted(), "a whole flow never halts");
 }
@@ -195,25 +215,25 @@ static void test_pubkey_rules(void)
     uint8_t pub[64];
     fill(pub, 64, 7);
     blank_v2();
-    run("write-pubkey 13", pub, 64, 1);
+    run(crcl("write-pubkey 13", pub, 64), pub, 64, 1);
     CHECK(failed() && VA.refused > 0, "no data write before the config lock");
     blank_v2();
     va_lock_config();
     va_lock_data();
-    run("write-pubkey 14", pub, 64, 1);
+    run(crcl("write-pubkey 14", pub, 64), pub, 64, 1);
     CHECK(failed() && va_pending() == 0, "slot 14 (WriteConfig Never) refuses after the data lock");
-    run("write-pubkey 13", pub, 64, 1);
+    run(crcl("write-pubkey 13", pub, 64), pub, 64, 1);
     CHECK(ok(), "slot 13 (PubInvalid) takes block writes after the data lock");
     CHECK(!halted(), "a refusal by the chip is not a framing error");
     VA.atcab_calls = 0;
-    run("write-pubkey 7", pub, 64, 1);
+    run(crcl("write-pubkey 7", pub, 64), pub, 64, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "slot 7 is not a public-key slot: refused, the stub halts");
     /* Why write-pubkey and not write-slot: a secret slot refuses the 4-byte words a 72-byte write ends with. */
     blank_v2();
     va_lock_config();
     uint8_t raw[72];
     fill(raw, 72, 3);
-    run("write-slot 13 0 72", raw, 72, 1);
+    run(crcl("write-slot 13 0 72", raw, 72), raw, 72, 1);
     CHECK(failed(), "write-slot into secret slot 13 fails on its trailing words");
 }
 
@@ -224,7 +244,7 @@ static void test_framing(void)
     blank_v2();
     va_lock_config();
     va_lock_data();
-    run("write-slot 11 0 72", rec, 64, 0);   /* the host dies 8 bytes short */
+    run(crcl("write-slot 11 0 72", rec, 72), rec, 64, 0);   /* the host dies 8 bytes short */
     CHECK(failed() && halted() && VA.atcab_calls == 0, "a short payload: Failure, halt, no write: %s", vt_captured());
     CHECK(strstr(vt_captured(), "got 64 of 72 bytes") && !strstr(vt_captured(), "terminator"),
           "and says exactly that (no terminator noise): %s", vt_captured());
@@ -235,24 +255,24 @@ static void test_framing(void)
     uint8_t longer[76];
     fill(longer, 76, 5);
     longer[72] = 0x41;
-    run("write-slot 11 0 72", longer, 76, 1);   /* 4 bytes more than declared */
+    run(crcl("write-slot 11 0 72", longer, 72), longer, 76, 1);   /* 4 bytes more than declared */
     CHECK(failed() && halted() && va_pending() == 0 && VA.atcab_calls == 0, "a length mismatch: Failure, halt, no write");
     CHECK(strstr(vt_captured(), "not the NUL terminator") != NULL, "says why");
     reload();
     longer[72] = 0x00;   /* codex R1.2: the byte at <len> happens to be 0x00 */
-    run("write-slot 11 0 72", longer, 76, 1);
+    run(crcl("write-slot 11 0 72", longer, 72), longer, 76, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "an oversized payload with 0x00 at <len>: Failure, halt, no write");
     CHECK(strstr(vt_captured(), "more input after") != NULL, "says why: %s", vt_captured());
     reload();
-    run("write-slot 11 0 72", rec, 72, 0);   /* no NUL */
+    run(crcl("write-slot 11 0 72", rec, 72), rec, 72, 0);   /* no NUL */
     CHECK(failed() && halted() && strstr(vt_captured(), "no NUL terminator") &&
               !strstr(vt_captured(), "not the NUL terminator"),
           "a missing NUL: Failure, halt, and says so: %s", vt_captured());
     reload();
-    run("write-slot 11 0 72", NULL, 0, 0);   /* nothing at all */
+    run(crcl("write-slot 11 0 72", rec, 72), NULL, 0, 0);   /* nothing at all */
     CHECK(failed() && halted() && strstr(vt_captured(), "got 0 of 72"), "no payload at all: Failure, not a hang");
     reload();
-    run("write-slot 11 0 72", rec, 72, 1);
+    run(crcl("write-slot 11 0 72", rec, 72), rec, 72, 1);
     CHECK(ok() && !halted() && memcmp(VA.data[11], rec, 72) == 0, "a fresh load takes a proper payload");
 
     /* write-pubkey frames the same way (before the data lock, as the flow writes the trust anchors) */
@@ -260,16 +280,16 @@ static void test_framing(void)
     va_lock_config();
     uint8_t pub[70];
     fill(pub, 70, 13);
-    run("write-pubkey 13", pub, 60, 0);
+    run(crcl("write-pubkey 13", pub, 64), pub, 60, 0);
     CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "got 60 of 64"),
           "a short public key: Failure, halt, nothing written: %s", vt_captured());
     reload();
     pub[64] = 0x00;
-    run("write-pubkey 13", pub, 70, 1);
+    run(crcl("write-pubkey 13", pub, 64), pub, 70, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "more input after"),
           "an oversized public key with 0x00 at byte 64: Failure, halt, nothing written");
     reload();
-    run("write-pubkey 13", pub, 64, 1);
+    run(crcl("write-pubkey 13", pub, 64), pub, 64, 1);
     CHECK(ok() && !halted(), "a whole public key frame is written");
 }
 
@@ -284,7 +304,7 @@ static int timed_write(uint32_t first_ms, uint32_t mid_ms, uint32_t nul_ms, uint
     va_feed_after(mid_ms, &rec[32], 40);
     va_feed_after(nul_ms, NUL1, 1);
     if (extra_ms) feed_str_after(extra_ms, "lock-slot 11\r");
-    return call("write-slot 10 0 72");
+    return call(crcl("write-slot 10 0 72", rec, 72));
 }
 
 static void test_timing(void)
@@ -317,7 +337,7 @@ static void test_session(void)
     blank_v2();
     va_lock_config();
     va_lock_data();
-    feed_str_after(0, "write-slot 10 0 4\r");
+    feed_crcl_after(0, "write-slot 10 0 4", (const uint8_t *)"ABCD", 4);
     feed_str_after(100, "ABCD");
     va_feed(NUL1, 1);
     feed_str_after(0, "lock-slot 11\r");
@@ -331,7 +351,9 @@ static void test_session(void)
     va_lock_data();
     uint8_t part[32];
     memset(part, 'x', sizeof part);
-    feed_str_after(0, "write-slot 11 0 72\r");
+    uint8_t xs[72];
+    memset(xs, 'x', sizeof xs);
+    feed_crcl_after(0, "write-slot 11 0 72", xs, 72);
     va_feed_after(100, part, 32);
     feed_str_after(1500, "lock-slot 11\r");
     va_feed(part, 27);
@@ -356,7 +378,7 @@ static void test_session(void)
     uint8_t rec[72];
     fill(rec, 72, 77);
     memcpy(&rec[10], "\rlock-slot 11\r", 14);
-    feed_str_after(0, "write-slot 10 0 72\r");
+    feed_crcl_after(0, "write-slot 10 0 72", rec, 72);
     va_feed_after(100, rec, 72);
     va_feed(NUL1, 1);
     feed_str_after(300, "read-slot 10 72\r");
@@ -369,7 +391,7 @@ static void test_session(void)
     /* not initialized: the whole frame is consumed, the next line is the host's */
     blank_v2();
     VA_CLI_READY = false;
-    feed_str_after(0, "write-slot 10 0 72\r");
+    feed_crcl_after(0, "write-slot 10 0 72", rec, 72);
     va_feed_after(100, rec, 72);
     va_feed(NUL1, 1);
     feed_str_after(300, "sleep\r");
@@ -381,9 +403,11 @@ static void test_bad_arguments(void)
 {
     uint8_t rec[72];
     fill(rec, 72, 21);
-    const char *bad[] = {"write-slot 10 0", "write-slot 10junk 0 72", "write-slot 16 0 72", "write-slot -1 0 72",
-                         "write-slot 10 0 0", "write-slot 10 0 417", "write-slot 10 x 72", "write-slot 10 0 72 9 9",
-                         "write-slot 10 0 99999999999999999999"};
+    /* each with a well-formed CRC32 argument, so the rule refusing it is the one named (step 3: a missing CRC32 halts
+     * on its own -- test_crc) */
+    const char *bad[] = {"write-slot 10 0", "write-slot 10junk 0 72 1", "write-slot 16 0 72 1", "write-slot -1 0 72 1",
+                         "write-slot 10 0 0 1", "write-slot 10 0 417 1", "write-slot 10 x 72 1", "write-slot 10 0 72 9 9",
+                         "write-slot 10 0 99999999999999999999 1"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         blank_v2();
         va_lock_config();
@@ -395,16 +419,17 @@ static void test_bad_arguments(void)
     blank_v2();
     va_lock_config();
     va_lock_data();
-    run("write-slot 10 2 72", rec, 72, 1);
+    run(crcl("write-slot 10 2 72", rec, 72), rec, 72, 1);
     CHECK(failed() && !halted() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0,
           "unaligned offset refused by the chip layer (whole frame consumed, no halt)");
-    run("write-slot 10 0 70", rec, 70, 1);
+    run(crcl("write-slot 10 0 70", rec, 70), rec, 70, 1);
     CHECK(failed() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0, "unaligned length refused");
-    run("write-slot 10 4 72", rec, 72, 1);
+    run(crcl("write-slot 10 4 72", rec, 72), rec, 72, 1);
     CHECK(failed() && VA.block_writes + VA.word_writes == 0, "past the end of a 72-byte slot refused");
-    run("write-slot 10 64 8", rec, 8, 1);
+    run(crcl("write-slot 10 64 8", rec, 8), rec, 8, 1);
     CHECK(ok() && memcmp(&VA.data[10][64], rec, 8) == 0, "the slot's last word is reachable");
-    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1 1", "write-pubkey 16", "write-pubkey 13x", "write-pubkey 7"};
+    const char *badpk[] = {"write-pubkey", "write-pubkey 13 1 1", "write-pubkey 16 1", "write-pubkey 13x 1",
+                           "write-pubkey 7 1"};
     uint8_t pub[64];
     fill(pub, 64, 1);
     for (size_t i = 0; i < sizeof badpk / sizeof badpk[0]; i++) {
@@ -434,15 +459,15 @@ static void test_not_initialized(void)
     va_lock_config();
     va_lock_data();
     VA_CLI_READY = false;
-    run("write-slot 10 0 72", rec, 72, 1);
+    run(crcl("write-slot 10 0 72", rec, 72), rec, 72, 1);
     CHECK(failed() && !halted() && va_pending() == 0 && VA.block_writes + VA.word_writes == 0,
           "write-slot before init: Failure, the whole frame consumed");
-    run("write-pubkey 13", rec, 64, 1);
+    run(crcl("write-pubkey 13", rec, 64), rec, 64, 1);
     CHECK(failed() && !halted() && va_pending() == 0, "write-pubkey before init: Failure, the whole frame consumed");
-    run("write-slot 10 0 72", rec, 64, 0);
+    run(crcl("write-slot 10 0 72", rec, 72), rec, 64, 0);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "before init, a broken frame still halts");
     reload();
-    run("write-pubkey 13", rec, 60, 0);
+    run(crcl("write-pubkey 13", rec, 64), rec, 60, 0);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "before init, a broken public-key frame still halts");
     reload();
     run("read-slot 10 72", NULL, 0, 0);
@@ -453,13 +478,13 @@ static void test_not_initialized(void)
     CHECK(failed() && VA.sleeps == 0, "sleep before init");
     VA_CLI_READY = true;
     VA_ATCAB_INIT = false;
-    run("write-slot 10 0 72", rec, 72, 1);
+    run(crcl("write-slot 10 0 72", rec, 72), rec, 72, 1);
     CHECK(failed() && VA.block_writes + VA.word_writes == 0, "the handler refuses without atcab init too");
     run("lock-slot 10", NULL, 0, 0);
     CHECK(failed() && !va_slot_locked(10), "lock-slot without atcab init");
     run("sleep", NULL, 0, 0);
     CHECK(failed() && VA.sleeps == 0, "sleep without atcab init");
-    run("write-pubkey 13", rec, 64, 1);
+    run(crcl("write-pubkey 13", rec, 64), rec, 64, 1);
     CHECK(failed() && VA.block_writes == 0, "write-pubkey without atcab init");
     run("read-slot 10 72", NULL, 0, 0);
     CHECK(failed(), "read-slot without atcab init");
@@ -550,8 +575,8 @@ static void test_sleep(void)
     CHECK(ok() && !VA.asleep && VA.wakes == 1, "the next command runs after a wake");
 }
 
-/* I9y7WaYU step 1: the optional payload CRC32, decimal, zlib's crc32(). The constants below were computed with Python's
- * zlib.crc32(), independently of the shim the stub links against. */
+/* I9y7WaYU: the payload CRC32, decimal, zlib's crc32() -- optional in step 1, REQUIRED from step 3. The constants below
+ * were computed with Python's zlib.crc32(), independently of the shim the stub links against. */
 #define CRC_REC_201 "3954926006"   /* zlib.crc32(fill(72, 201)) */
 #define CRC_PUB_202 "1410416443"   /* zlib.crc32(fill(64, 202)) */
 #define CRC_R21     "130108043"    /* zlib.crc32(b"ABCD\0lock-slot 11\r"): what a host sending that payload computes */
@@ -575,8 +600,12 @@ static void test_crc(void)
     reload();
     run("write-slot 11 0 72 0003954926006", rec, 72, 1);
     CHECK(ok() && memcmp(VA.data[11], rec, 72) == 0, "leading zeros are still the same decimal number");
+    VA.atcab_calls = 0;
     run("write-slot 12 0 72", rec, 72, 1);
-    CHECK(ok() && memcmp(VA.data[12], rec, 72) == 0, "no CRC32: accepted as before (step 1 keeps the old host working)");
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading") &&
+              strstr(vt_captured(), "write-slot without the payload CRC32 this stub requires") &&
+              strstr(vt_captured(), "device-config-management 0.1.20 or later"),
+          "no CRC32 (an old host): Failure and halt before the payload is read, and it says why: %s", vt_captured());
     const char *bad[] = {"write-slot 10 0 72 12x", "write-slot 10 0 72 -1", "write-slot 10 0 72 +5",
                          "write-slot 10 0 72 0x1F", "write-slot 10 0 72 4294967296", "write-slot 10 0 72 1 2"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
@@ -597,6 +626,12 @@ static void test_crc(void)
     VA.atcab_calls = 0;
     run("write-pubkey 15 1410416442", pub, 64, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "write-pubkey with a wrong CRC32: halt before any chip call");
+    reload();
+    run("write-pubkey 14", pub, 64, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading") &&
+              strstr(vt_captured(), "write-pubkey without the payload CRC32 this stub requires") &&
+              strstr(vt_captured(), "device-config-management 0.1.20 or later"),
+          "write-pubkey without a CRC32: Failure and halt before the payload is read, and it says why: %s", vt_captured());
     const char *badpk[] = {"write-pubkey 13 x", "write-pubkey 13 +1", "write-pubkey 13 1 2"};
     for (size_t i = 0; i < sizeof badpk / sizeof badpk[0]; i++) {
         reload();
@@ -613,7 +648,9 @@ static void test_crc(void)
     CHECK(failed() && !halted() && va_pending() == 0 && VA.atcab_calls == 0,
           "not initialized, right CRC32: Failure, frame consumed, no halt");
     run("write-slot 10 0 72", rec, 72, 1);
-    CHECK(failed() && !halted() && va_pending() == 0, "not initialized, no CRC32: Failure, frame consumed, no halt");
+    CHECK(failed() && halted() && VA.atcab_calls == 0 && !strstr(vt_captured(), "Reading"),
+          "not initialized, no CRC32: halt before the payload is read");
+    reload();
     run("write-slot 10 0 72 1", rec, 72, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "not initialized, wrong CRC32: halt");
     reload();
@@ -621,6 +658,9 @@ static void test_crc(void)
     CHECK(failed() && !halted() && va_pending() == 0, "not initialized, write-pubkey, right CRC32: Failure, no halt");
     run("write-pubkey 13 1", pub, 64, 1);
     CHECK(failed() && halted() && VA.atcab_calls == 0, "not initialized, write-pubkey, wrong CRC32: halt");
+    reload();
+    run("write-pubkey 13", pub, 64, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "not initialized, write-pubkey, no CRC32: halt");
     reload();
     feed_str_after(0, "write-slot 10 0 4 " CRC_R21 "\r");
     feed_str_after(100, "ABCD");
@@ -643,7 +683,8 @@ static void test_crc(void)
     va_feed(NUL1, 1);
     CHECK(session() == 1 && !va_slot_locked(11) && VA.atcab_calls == 0 && halted(),
           "R2.1 with the CRC32: the late \"lock-slot 11\" is never dispatched, nothing written: %s", vt_captured());
-    /* ... and without it, the residual this card exists for (step 3 makes the CRC32 mandatory). */
+    /* ... and without it, the residual this card exists for, closed by step 3: a write-slot with no CRC32 halts before
+     * its payload is read, so nothing that follows is dispatched. */
     blank_v2();
     va_lock_config();
     va_lock_data();
@@ -652,8 +693,28 @@ static void test_crc(void)
     va_feed(NUL1, 1);
     feed_str_after(150, "lock-slot 11\r");
     va_feed(NUL1, 1);
-    CHECK(session() == 2 && va_slot_locked(11),
-          "R2.1 WITHOUT the CRC32: the late suffix still runs -- why step 3 makes the CRC32 mandatory");
+    CHECK(session() == 1 && !va_slot_locked(11) && VA.atcab_calls == 0 && halted(),
+          "R2.1 WITHOUT the CRC32: the late \"lock-slot 11\" is never dispatched, nothing written: %s", vt_captured());
+}
+
+/* dcm 0.1.20 (fbf_device_config/provisioning/replacement.py CRC_USAGE_PATTERNS) sends the CRC32 only when `help` matches
+ * r"write-slot <slot> <offset> <len> \[<crc32>\]" and r"write-pubkey <slot>[^\n]*\[<crc32>\]" -- the brackets are its
+ * probe. A usage line without them gets no CRC32 from dcm, and step 3 then halts every write. */
+static const char *help_of(const char *name)
+{
+    for (int i = 0; i < vt_ncmds; i++)
+        if (strcmp(vt_cmds[i].command, name) == 0) return vt_cmds[i].help;
+    return "";
+}
+static void test_help_probe(void)
+{
+    const char *ws = help_of("write-slot"), *wp = help_of("write-pubkey");
+    CHECK(strstr(ws, "write-slot <slot> <offset> <len> [<crc32>]") != NULL, "dcm's write-slot probe matches: %s", ws);
+    const char *u = strstr(wp, "write-pubkey <slot>");
+    const char *b = u ? strstr(u, "[<crc32>]") : NULL;
+    const char *nl = u ? strchr(u, '\n') : NULL;
+    CHECK(b != NULL && (nl == NULL || b < nl), "dcm's write-pubkey probe matches on one line: %s", wp);
+    CHECK(strstr(ws, "REQUIRED") != NULL && strstr(wp, "REQUIRED") != NULL, "and both say the CRC32 is required");
 }
 
 int main(void)
@@ -674,6 +735,7 @@ int main(void)
     test_handlers_direct();
     test_sleep_failure();
     test_crc();
+    test_help_probe();
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -1,5 +1,6 @@
 /*
- * GTL 24: console commands write-slot / read-slot / lock-slot / write-pubkey / sleep.
+ * GTL 24: console commands write-slot / read-slot / lock-slot / write-pubkey / sleep, and write-data (moved here from
+ * commands.c so it frames like the others: Trello I9y7WaYU).
  *
  * THE WIRE (the host side is device-config-management CommandInterpreter.exec_cmd): the host writes "<command>\r"; for
  * a command that carries data it waits 100 ms, writes the raw bytes, then one NUL. The bytes are BINARY (a certificate
@@ -18,12 +19,19 @@
  * fault -- before an irreversible operation, which is exactly when stopping is right. Every read is bounded, so a host
  * that never sends the payload gets the Failure, not a stub that hangs.
  *
- * PAYLOAD CRC32 (Trello I9y7WaYU, step 1 of 3). write-slot and write-pubkey take an OPTIONAL last argument: the CRC32 of
- * the payload, in decimal, exactly as write-config / program-dev-cert take theirs (zlib's crc32() on the host,
+ * PAYLOAD CRC32 (Trello I9y7WaYU, step 3 of 3). write-slot and write-pubkey REQUIRE a last argument: the CRC32 of the
+ * payload, in decimal, exactly as write-config / program-dev-cert take theirs (zlib's crc32() on the host,
  * esp_rom_crc32_le(0, ...) here). It binds the declared <len> to the bytes the host sent: a payload that is longer than
  * declared fails the check even when its byte at <len> is 0x00 and the rest arrives after the quiet line -- the one
  * case the framing alone cannot see (codex R2.1 on #12). A mismatch is a broken frame: the stub halts, before any chip
- * call. Step 2: the host always sends it. Step 3: the stub requires it.
+ * call. So is a command line WITHOUT the CRC32 (a host older than device-config-management 0.1.20): its frame cannot be
+ * bound, so the stub halts before reading it. Step 1 made the argument optional; step 2 (dcm 0.1.20) sends it whenever
+ * this stub's `help` lists it.
+ *
+ * THAT `help` IS dcm's PROBE. dcm 0.1.20 sends the CRC32 only when the help text matches both
+ * "write-slot <slot> <offset> <len> [<crc32>]" and "write-pubkey <slot>...[<crc32>]", brackets included; a stub whose
+ * usage dropped them would get no CRC32 from it and halt every write. So the usage lines keep their bytes, and the
+ * description says the argument is required (pinned by the host test).
  */
 #include <errno.h>
 #include <stdbool.h>
@@ -149,7 +157,7 @@ static esp_err_t finish(esp_err_t ret)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-/* The optional payload CRC32: a whole decimal token, digits only (strtoul would take "-1" as 4294967295), at most
+/* The payload CRC32: a whole decimal token, digits only (strtoul would take "-1" as 4294967295), at most
  * 4294967295. */
 static bool parse_crc32(const char *tok, uint32_t *out)
 {
@@ -189,11 +197,14 @@ static esp_err_t write_slot_cmd(int argc, char **argv)
     int err_code = 0;
     int slot, offset, len;
     uint32_t crc = 0;
-    const bool have_crc = (argc == 5);
-    if ((argc != 4 && argc != 5) || !parse_int(argv[1], 0, 15, &slot) ||
-        !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) || !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len) ||
-        (have_crc && !parse_crc32(argv[4], &crc))) {
-        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len> [<crc32>]  (then <len> raw bytes + NUL)");
+    if (argc == 4) {
+        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len> <crc32>  (then <len> raw bytes + NUL)");
+        return fail_stop("write-slot without the payload CRC32 this stub requires: the host must be device-config-management "
+                         "0.1.20 or later");
+    }
+    if (argc != 5 || !parse_int(argv[1], 0, 15, &slot) || !parse_int(argv[2], 0, GTL24_MAX_WRITE, &offset) ||
+        !parse_int(argv[3], 1, GTL24_MAX_WRITE, &len) || !parse_crc32(argv[4], &crc)) {
+        ESP_LOGE(TAG, "Usage: write-slot <slot> <offset> <len> <crc32>  (then <len> raw bytes + NUL)");
         return fail_stop("write-slot arguments: the payload length cannot be trusted");
     }
     /* Not initialized or not, the frame is consumed whole and its CRC32 checked: a refusal must not leave a broken
@@ -208,7 +219,7 @@ static esp_err_t write_slot_cmd(int argc, char **argv)
     if (!consume_frame(buf, (size_t)len)) {
         return fail_stop("write-slot payload");
     }
-    if (have_crc && !crc32_matches(buf, (size_t)len, crc)) {
+    if (!crc32_matches(buf, (size_t)len, crc)) {
         return fail_stop("write-slot payload CRC32");
     }
     if (!ready) {
@@ -265,9 +276,13 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
     int err_code = 0;
     int slot;
     uint32_t crc = 0;
-    const bool have_crc = (argc == 3);
-    if ((argc != 2 && argc != 3) || !parse_int(argv[1], 8, 15, &slot) || (have_crc && !parse_crc32(argv[2], &crc))) {
-        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15> [<crc32>]  (then 64 raw bytes X||Y + NUL)");
+    if (argc == 2) {
+        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15> <crc32>  (then 64 raw bytes X||Y + NUL)");
+        return fail_stop("write-pubkey without the payload CRC32 this stub requires: the host must be "
+                         "device-config-management 0.1.20 or later");
+    }
+    if (argc != 3 || !parse_int(argv[1], 8, 15, &slot) || !parse_crc32(argv[2], &crc)) {
+        ESP_LOGE(TAG, "Usage: write-pubkey <slot 8-15> <crc32>  (then 64 raw bytes X||Y + NUL)");
         return fail_stop("write-pubkey arguments");
     }
     const bool ready = ecu_cli_atecc_ready();
@@ -280,7 +295,7 @@ static esp_err_t write_pubkey_cmd(int argc, char **argv)
     if (!consume_frame(pub, sizeof pub)) {
         return fail_stop("write-pubkey payload");
     }
-    if (have_crc && !crc32_matches(pub, sizeof pub, crc)) {
+    if (!crc32_matches(pub, sizeof pub, crc)) {
         return fail_stop("write-pubkey payload CRC32");
     }
     if (!ready) {
@@ -308,7 +323,8 @@ esp_err_t register_gtl24_commands(void)
 {
     const esp_console_cmd_t cmds[] = {
         {.command = "write-slot",
-         .help = "Write <len> raw bytes at <offset> of a data slot, optionally CRC32-checked (decimal, as write-config)\n"
+         .help = "Write <len> raw bytes at <offset> of a data slot, CRC32-checked: the <crc32> is REQUIRED (decimal, as "
+                 "write-config)\n"
                  "  Usage: write-slot <slot> <offset> <len> [<crc32>]",
          .func = &write_slot_cmd},
         {.command = "read-slot",
@@ -319,7 +335,8 @@ esp_err_t register_gtl24_commands(void)
          .help = "Individually lock a Lockable data slot (IRREVERSIBLE; after the data lock)\n  Usage: lock-slot <slot>",
          .func = &lock_slot_cmd},
         {.command = "write-pubkey",
-         .help = "Write a P-256 public key (64 bytes X||Y) to slot 8-15 in stored format, optionally CRC32-checked\n"
+         .help = "Write a P-256 public key (64 bytes X||Y) to slot 8-15 in stored format, CRC32-checked: the <crc32> is "
+                 "REQUIRED\n"
                  "  Usage: write-pubkey <slot> [<crc32>]",
          .func = &write_pubkey_cmd},
         {.command = "sleep",
