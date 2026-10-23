@@ -7,7 +7,8 @@
  *     write needs WriteConfig Always, and a PubInvalid slot (WriteConfig 1) takes block writes (DS 2.2.7.2, 2.4.3);
  *   - clear reads only after the data lock and never from an IsSecret slot (DS 2.4.2 Table 2-14, 2.2.7.1);
  *   - a slot lock only after the data lock, only on a Lockable slot, only once (DS 11.10, 2.4.3);
- *   - sleep, then the next command wakes the chip.
+ *   - sleep, then the next command wakes the chip; a sleep word is acknowledged ONLY directly after a wake: after any
+ *     other command the chip is idle/asleep and NACKs it (the real part on the 11b bench, IkV6BHhH 2026-10-23).
  * The CALIB layer is reproduced too: write/read_bytes_zone refuse non-word offsets and lengths and anything past the
  * slot, then go block-by-block where a whole aligned block remains and word-by-word otherwise; write_pubkey is three
  * 32-byte block writes of (pad, X, pad, Y) -- exactly the library's calib_write_pubkey.
@@ -27,6 +28,9 @@ typedef struct {
     int     block_writes, word_writes, refused;
     int     atcab_calls;   /* every CryptoAuthLib call the stub made */
     bool    fail_sleep;    /* fault injection: the next atcab_sleep() fails */
+    bool    fail_wake;     /* fault injection: the next atcab_wakeup() fails */
+    bool    woken;         /* atcab_wakeup() was the last chip interaction: a sleep word will be acknowledged */
+    int     nacks;         /* sleep words sent to a chip that was not awake */
     int     prompts;       /* "\n>>\n" written straight to the console (the halt's; the loop's own are not modelled) */
 } vatecc_t;
 

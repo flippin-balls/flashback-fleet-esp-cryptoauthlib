@@ -136,6 +136,17 @@ esp_err_t atecc_sleep(int *err_ret)
         *err_ret = ret;
         return ESP_FAIL;
     }
+    /* WAKE FIRST (IkV6BHhH 11b, 2026-10-23). After the previous command the chip is already idle/asleep and does not
+     * acknowledge on the bus, so a bare sleep word is NACKed ("HAL_I2C: Send: Device not responding at address 0x60")
+     * and `sleep` reported Failure on a healthy chip -- which made device-config-management's sleep/wake read-back
+     * gate refuse every template-v2 lock. Wake it, then put it to sleep from a known-awake state: the next command
+     * then genuinely runs after a fresh wake, under the stored ChipMode, which is what that gate exists to check. */
+    ret = atcab_wakeup();
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "sleep: wake failed (0x%02x) -- the chip was NOT put to sleep", ret);
+        *err_ret = ret;
+        return ESP_FAIL;
+    }
     ret = atcab_sleep();
     *err_ret = ret;
     return (ret == ATCA_SUCCESS) ? ESP_OK : ESP_FAIL;
