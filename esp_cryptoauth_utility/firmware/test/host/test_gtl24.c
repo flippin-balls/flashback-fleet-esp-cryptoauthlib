@@ -577,6 +577,31 @@ static void test_sleep_failure(void)
     CHECK(failed() && !VA.asleep, "a sleep the chip refuses is a Failure");
 }
 
+static void test_sleep_after_a_command(void)
+{
+    /* The bench case: the previous command left the chip idle. The stub must wake it first, or the sleep word is NACKed
+     * and `sleep` fails on a healthy chip (IkV6BHhH 11b). */
+    blank_v2();
+    va_lock_config();
+    va_lock_data();
+    run("read-slot 10 4", NULL, 0, 0);
+    CHECK(ok() && !VA.woken, "precondition: a command ran, the chip is idle");
+    run("sleep", NULL, 0, 0);
+    CHECK(ok() && VA.asleep && VA.sleeps == 1 && VA.nacks == 0, "sleep after a command succeeds (wake first, no NACK)");
+    run("sleep", NULL, 0, 0);
+    CHECK(ok() && VA.asleep && VA.sleeps == 2 && VA.nacks == 0, "sleep on an already-sleeping chip succeeds too");
+    run("read-slot 10 4", NULL, 0, 0);
+    CHECK(ok() && !VA.asleep, "and the next command runs after a wake");
+}
+
+static void test_wake_failure(void)
+{
+    blank_v2();
+    VA.fail_wake = true;
+    run("sleep", NULL, 0, 0);
+    CHECK(failed() && !VA.asleep && VA.sleeps == 0 && VA.nacks == 0, "a wake the chip refuses is a Failure, and no sleep word is sent");
+}
+
 static void test_sleep(void)
 {
     blank_v2();
@@ -835,6 +860,8 @@ int main(void)
     test_read_rules();
     test_lock_rules();
     test_sleep();
+    test_sleep_after_a_command();
+    test_wake_failure();
     test_timing();
     test_session();
     test_handlers_direct();

@@ -10,6 +10,8 @@ here, main = sys.argv[1:3]
 C, S = "gtl24_cmds.c", "gtl24_slots.c"
 M = [
   # framing (gtl24_cmds.c)
+  (S, "sleep without the wake (IkV6BHhH)", "    ret = atcab_wakeup();\n    if (ret != ATCA_SUCCESS) {", "    ret = ATCA_SUCCESS;\n    if (ret != ATCA_SUCCESS) {"),
+  (S, "wake failure ignored",               "        ESP_LOGE(TAG, \"sleep: wake failed (0x%02x) -- the chip was NOT put to sleep\", ret);\n        *err_ret = ret;\n        return ESP_FAIL;", "        ESP_LOGE(TAG, \"sleep: wake failed (0x%02x) -- the chip was NOT put to sleep\", ret);"),
   (C, "short payload tolerated",         "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            return false;", "            ESP_LOGE(TAG, \"payload: got %u of %u bytes\", (unsigned)i, (unsigned)len);\n            break;"),
   (C, "terminator absence tolerated",    "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);\n        return false;", "        ESP_LOGE(TAG, \"payload: no NUL terminator after %u bytes\", (unsigned)len);"),
   (C, "terminator not checked",          "    if (b != 0) {", "    if (0) {"),

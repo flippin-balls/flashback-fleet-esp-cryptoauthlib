@@ -43,6 +43,7 @@ static unsigned write_config(int s) { return (sc(s) >> 12) & 0xFu; }
 static void wake(void)
 {
     if (VA.asleep) { VA.asleep = false; VA.wakes++; }
+    VA.woken = false;   /* a command ran: afterwards the chip idles again */
 }
 
 /* One Write command: a whole block (n == 32, at a block boundary) or a word (n == 4). */
@@ -136,9 +137,20 @@ ATCA_STATUS atcab_write_pubkey(uint16_t slot, const uint8_t *public_key)
     return ATCA_SUCCESS;
 }
 
+ATCA_STATUS atcab_wakeup(void)
+{
+    VA.atcab_calls++;
+    if (VA.fail_wake) { VA.fail_wake = false; return ATCA_COMM_FAIL; }
+    if (VA.asleep) { VA.asleep = false; VA.wakes++; }
+    VA.woken = true;
+    return ATCA_SUCCESS;
+}
+
 ATCA_STATUS atcab_sleep(void)
 {
     VA.atcab_calls++;
+    if (!VA.woken) { VA.nacks++; return ATCA_COMM_FAIL; }   /* idle/asleep: the sleep word is not acknowledged */
+    VA.woken = false;
     if (VA.fail_sleep) { VA.fail_sleep = false; return ATCA_EXECUTION_ERROR; }
     VA.asleep = true;
     VA.sleeps++;
