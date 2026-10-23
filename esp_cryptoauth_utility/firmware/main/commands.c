@@ -165,13 +165,28 @@ static esp_err_t register_print_chip_info()
     return esp_console_cmd_register(&cmd);
 }
 
+/* Any ATECC slot 0-15, as one whole decimal token. The upstream check was `atoi(slot) < 3` (the v1 template's key
+ * slots 0-2), which refused template v2's attestation key in slot 4 before the chip saw a command (IkV6BHhH 11b,
+ * 2026-10-23: "GenKey slot 4 failed: Reason: Invalid Usage" right after the config lock). Which slots may hold a
+ * generated key is the chip's rule (KeyConfig.Private), not this parser's: a non-private slot is refused by GenKey. */
+static bool genkey_slot_arg(const char *tok, int *slot)
+{
+    char *end = NULL;
+    if (tok == NULL || *tok < '0' || *tok > '9') return false;
+    const long v = strtol(tok, &end, 10);
+    if (end == tok || *end != '\0' || v < 0 || v > 15) return false;
+    *slot = (int)v;
+    return true;
+}
+
 static esp_err_t generate_key_pair(int argc, char **argv)
 {
     esp_err_t ret = ESP_ERR_INVALID_ARG;
     int err_code;
+    int slot = -1;
     if (atca_cli_status_object >= ATECC_INIT_SUCCESS) {
-        if (argc == 2 && (atoi(argv[1]) < 3)) {
-            ret = atecc_keygen(atoi(argv[1]), crypt_buf_public_key, CRYPT_BUF_PUB_KEY_LEN, &err_code);
+        if (argc == 2 && genkey_slot_arg(argv[1], &slot)) {
+            ret = atecc_keygen(slot, crypt_buf_public_key, CRYPT_BUF_PUB_KEY_LEN, &err_code);
         }
         ESP_LOGI(TAG, "Status: %s\n", ret ? "Failure" : "Success");
         atca_cli_status_object = ret ? KEY_PAIR_GEN_FAIL : KEY_PAIR_GEN_SUCCESS;
