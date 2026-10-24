@@ -128,6 +128,58 @@ exit:
     return ESP_FAIL;
 }
 
+/* GTL 11c (Trello uu5YuabE). A template-v2s chip's slot 15 (the SecureBoot / OTA public key) is PubInvalid: every write
+ * leaves it invalid and SecureBoot refuses it until Verify(Validate) succeeds under the parent key in slot 14 (DS 4.4,
+ * 11.21). The parent's private half is OFFLINE (trust-anchor custody), so the host brings a token signed in advance:
+ * TempKey is set by a pass-through Nonce (a fixed num_in, so the token can be computed off the chip -- slot 14 has
+ * ReqRandom 0 by design, T3), GenKey in PubKey-digest mode folds the slot's key into TempKey, and Verify(Validate)
+ * checks the parent's signature over the Sign(Internal)-format message built from TempKey and verify_other. The order
+ * is the library's own (cryptoauthlib test_basic_verify_validate). A chip "not verified" is a refusal, not an error. */
+esp_err_t atecc_validate_pubkey_slot(int slot, const unsigned char num_in[32], const unsigned char genkey_other[3],
+                                     const unsigned char verify_other[19], const unsigned char sig[64], bool *verified,
+                                     int *err_ret)
+{
+    int ret = ATCA_BAD_PARAM;
+    bool ok = false;
+    if (verified != NULL) {
+        *verified = false;
+    }
+    if (!atecc_is_initialized()) {
+        ESP_LOGE(TAG, "Device is not initialized");
+        goto exit;
+    }
+    if (num_in == NULL || genkey_other == NULL || verify_other == NULL || sig == NULL || verified == NULL || slot < 8 ||
+        slot > 15) {
+        goto exit;
+    }
+    ret = atcab_nonce(num_in);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "validate-pubkey %d: Nonce failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    ret = atcab_genkey_base(GENKEY_MODE_PUBKEY_DIGEST, (uint16_t)slot, genkey_other, NULL);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "validate-pubkey %d: GenKey (PubKey digest) failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    ret = atcab_verify_validate((uint16_t)slot, sig, verify_other, &ok);
+    if (ret != ATCA_SUCCESS) {
+        ESP_LOGE(TAG, "validate-pubkey %d: Verify(Validate) failed, returned %02x", slot, ret);
+        goto exit;
+    }
+    *verified = ok;
+    if (!ok) {
+        ESP_LOGE(TAG, "validate-pubkey %d: the chip did NOT verify the token (wrong parent key, public key or OtherData)",
+                 slot);
+        goto exit;
+    }
+    *err_ret = ret;
+    return ESP_OK;
+exit:
+    *err_ret = ret;
+    return ESP_FAIL;
+}
+
 esp_err_t atecc_sleep(int *err_ret)
 {
     int ret = ATCA_BAD_PARAM;

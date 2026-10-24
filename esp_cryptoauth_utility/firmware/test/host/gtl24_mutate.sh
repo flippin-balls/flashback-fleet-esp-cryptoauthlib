@@ -78,7 +78,7 @@ M = [
   # (not listed: dropping the errno test is EQUIVALENT -- every bound here is far below LONG_MAX, so an overflowed
   #  strtol result is out of range either way)
   (C, "write-slot len 0 allowed",        "!parse_int(argv[3], 1, GTL24_MAX_WRITE, &len)", "!parse_int(argv[3], 0, GTL24_MAX_WRITE, &len)"),
-  (C, "write-pubkey slot 7 allowed",     "!parse_int(argv[1], 8, 15, &slot)", "!parse_int(argv[1], 7, 15, &slot)"),
+  (C, "write-pubkey slot 7 allowed",     "!parse_int(argv[1], 8, 15, &slot) || !parse_crc32(argv[2], &crc)) {", "!parse_int(argv[1], 7, 15, &slot) || !parse_crc32(argv[2], &crc)) {"),
   (C, "read-slot readiness unchecked",   "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    const esp_err_t ret", "    const esp_err_t ret"),
   (C, "lock-slot readiness unchecked",   "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    return finish(atecc_lock_slot", "    return finish(atecc_lock_slot"),
   (C, "sleep readiness unchecked (cmd)", "    if (!ecu_cli_atecc_ready()) {\n        ESP_LOGE(TAG, \"Please initialize device before calling this function\");\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    return finish(atecc_sleep", "    return finish(atecc_sleep"),
@@ -101,6 +101,17 @@ M = [
   (S, "lock success on chip refusal",    "        ESP_LOGE(TAG, \"lock-slot %d failed, returned %02x\", slot, ret);\n        goto exit;", "        ESP_LOGE(TAG, \"lock-slot %d failed, returned %02x\", slot, ret);"),
   (S, "lock readiness unchecked",        "esp_err_t atecc_lock_slot(int slot, int *err_ret)\n{\n    int ret = ATCA_BAD_PARAM;\n    if (!atecc_is_initialized()) {", "esp_err_t atecc_lock_slot(int slot, int *err_ret)\n{\n    int ret = ATCA_BAD_PARAM;\n    if (0) {"),
   (S, "pubkey via write_bytes_zone",     "    ret = atcab_write_pubkey((uint16_t)slot, pubkey64);", "    { uint8_t f_[72] = {0}; for (int i_ = 0; i_ < 32; i_++) { f_[4 + i_] = pubkey64[i_]; f_[40 + i_] = pubkey64[32 + i_]; }\n      ret = atcab_write_bytes_zone(ATCA_ZONE_DATA, (uint16_t)slot, 0, f_, 72); }"),
+  # GTL 11c validate-pubkey
+  (C, "validate: bad args just fail",    "        return fail_stop(\"validate-pubkey arguments\");", "        return finish(ESP_ERR_INVALID_ARG);"),
+  (C, "validate: slot 7 allowed",        "!parse_int(argv[1], 8, 15, &slot) /* validate */", "!parse_int(argv[1], 7, 15, &slot) /* validate */"),
+  (C, "validate: CRC never checked",     "    if (!crc32_matches(p, sizeof p, crc)) {", "    if (0) {"),
+  (C, "validate: broken frame used",     "    if (!consume_frame(p, sizeof p)) {\n        return fail_stop(\"validate-pubkey payload\");\n    }", "    (void)consume_frame(p, sizeof p);"),
+  (C, "validate: readiness unchecked",   "    if (!ready) {\n        return finish(ESP_ERR_INVALID_STATE);\n    }\n    const esp_err_t ret = atecc_validate_pubkey_slot(", "    const esp_err_t ret = atecc_validate_pubkey_slot("),
+  (C, "validate: token fields shifted",  "&p[0], &p[32], &p[35], &p[54]", "&p[0], &p[32], &p[35], &p[53]"),
+  (S, "validate: no nonce first",        "    ret = atcab_nonce(num_in);", "    ret = ATCA_SUCCESS;"),
+  (S, "validate: no GenKey digest",      "    ret = atcab_genkey_base(GENKEY_MODE_PUBKEY_DIGEST, (uint16_t)slot, genkey_other, NULL);", "    ret = ATCA_SUCCESS;"),
+  (S, "validate: not-verified is success", "    *verified = ok;\n    if (!ok) {", "    *verified = ok;\n    if (0) {"),
+  (S, "validate: slot range opened",     "verified == NULL || slot < 8 ||", "verified == NULL || slot < 0 ||"),
   (S, "pubkey slot 7 allowed",           "if (pubkey64 == NULL || slot < 8 || slot > 15) {", "if (pubkey64 == NULL || slot < 7 || slot > 15) {"),
   (S, "pubkey success on chip refusal",  "        ESP_LOGE(TAG, \"write-pubkey %d failed, returned %02x\", slot, ret);\n        goto exit;", "        ESP_LOGE(TAG, \"write-pubkey %d failed, returned %02x\", slot, ret);"),
   (S, "pubkey readiness unchecked",      "esp_err_t atecc_write_pubkey_slot(int slot, const unsigned char *pubkey64, int *err_ret)\n{\n    int ret = ATCA_BAD_PARAM;\n    if (!atecc_is_initialized()) {", "esp_err_t atecc_write_pubkey_slot(int slot, const unsigned char *pubkey64, int *err_ret)\n{\n    int ret = ATCA_BAD_PARAM;\n    if (0) {"),

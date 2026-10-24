@@ -22,8 +22,15 @@ esp_err_t atecc_read_slot(int slot, unsigned char *data_buf, size_t data_len, in
 esp_err_t atecc_lock_slot(int slot, int *err_ret);
 esp_err_t atecc_write_pubkey_slot(int slot, const unsigned char *pubkey64, int *err_ret);
 esp_err_t atecc_sleep(int *err_ret);
+/* GTL 11c: Verify(Validate) a PubInvalid public key (template v2s slot 15) with an offline parent-key token: Nonce
+ * pass-through num_in, GenKey PubKey-digest over the slot (genkey_other = GenKey OtherData), then Verify(Validate) with
+ * verify_other (19 bytes) and the 64-byte signature. ESP_OK only when the chip VERIFIED; *verified says which. */
+esp_err_t atecc_validate_pubkey_slot(int slot, const unsigned char num_in[32], const unsigned char genkey_other[3],
+                                     const unsigned char verify_other[19], const unsigned char sig[64], bool *verified,
+                                     int *err_ret);
 
-/* gtl24_cmds.c -- registers write-slot / read-slot / lock-slot / write-pubkey / sleep / write-data with esp_console. */
+/* gtl24_cmds.c -- registers write-slot / read-slot / lock-slot / write-pubkey / sleep / write-data / validate-pubkey with
+ * esp_console. */
 esp_err_t register_gtl24_commands(void);
 
 /* handlers.c -- the 32-byte data write behind write-data (the same prototype as handlers.h). */

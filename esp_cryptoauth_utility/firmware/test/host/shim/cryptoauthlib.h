@@ -16,3 +16,8 @@ ATCA_STATUS atcab_lock_data_slot(uint16_t slot);
 ATCA_STATUS atcab_write_pubkey(uint16_t slot, const uint8_t *public_key);
 ATCA_STATUS atcab_wakeup(void);
 ATCA_STATUS atcab_sleep(void);
+#include <stdbool.h>
+#define GENKEY_MODE_PUBKEY_DIGEST ((uint8_t)0x10)
+ATCA_STATUS atcab_nonce(const uint8_t *num_in);
+ATCA_STATUS atcab_genkey_base(uint8_t mode, uint16_t key_id, const uint8_t *other_data, uint8_t *public_key);
+ATCA_STATUS atcab_verify_validate(uint16_t key_id, const uint8_t *signature, const uint8_t *other_data, bool *is_verified);
