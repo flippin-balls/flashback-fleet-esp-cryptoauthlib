@@ -163,9 +163,9 @@ esp_err_t atecc_write_data(int slot, unsigned char *data_buf, size_t data_len, i
 
 static void test_registration(void)
 {
-    const char *names[] = {"write-slot", "read-slot", "lock-slot", "write-pubkey", "sleep", "write-data"};
-    for (int i = 0; i < 6; i++) CHECK(find(names[i]) != NULL, "%s registered", names[i]);
-    CHECK(vt_ncmds == 6, "exactly the six commands (%d)", vt_ncmds);
+    const char *names[] = {"write-slot", "read-slot", "lock-slot", "write-pubkey", "sleep", "write-data", "validate-pubkey"};
+    for (int i = 0; i < 7; i++) CHECK(find(names[i]) != NULL, "%s registered", names[i]);
+    CHECK(vt_ncmds == 7, "exactly the seven commands (%d)", vt_ncmds);
 }
 
 /* The bench flow's order: config locked, trust anchors 13-15, data lock, the record 10-12, read back, slot locks. */
@@ -183,6 +183,7 @@ static void test_template_v2_flow(void)
         uint8_t stored[72] = {0};
         memcpy(&stored[4], pub[k], 32);
         memcpy(&stored[40], &pub[k][32], 32);
+        if (k != 1) stored[0] = 0xA0;   /* 13 and 15 are PubInfo keys: a write leaves them invalid (DS 4.4); 14 is not */
         CHECK(memcmp(VA.data[13 + k], stored, 72) == 0, "slot %d holds (pad, X, pad, Y)", 13 + k);
     }
     CHECK(VA.word_writes == 0, "public keys go in as whole blocks only (%d word writes)", VA.word_writes);
@@ -847,6 +848,97 @@ static void test_write_data(void)
     CHECK(failed() && !halted() && WD.calls == 1 && st && why && st < why, "a chip refusal: %s", vt_captured());
 }
 
+
+/* GTL 11c validate-pubkey: a locked v2/v2s chip, slot 15 written (invalid), then the offline token. */
+static void validate_setup(uint8_t tok[118])
+{
+    blank_v2();
+    va_lock_config();
+    uint8_t pub[64];
+    fill(pub, 64, 15);
+    run(crcl("write-pubkey 15", pub, 64), pub, 64, 1);
+    CHECK(ok(), "slot 15 written before the data lock");
+    va_lock_data();
+    fill(tok, 118, 77);
+    memset(tok, 0, 32);                        /* num_in: the fixed pass-through nonce */
+    memset(tok + 32, 0, 3);                    /* GenKey OtherData */
+    memcpy(VA.validate_numin, tok, 32);
+    memcpy(VA.validate_genkey_other, tok + 32, 3);
+    memcpy(VA.validate_other, tok + 35, 19);
+    memcpy(VA.validate_sig, tok + 54, 64);
+    VA.atcab_calls = 0;
+}
+
+static void test_validate_pubkey(void)
+{
+    uint8_t tok[118];
+    validate_setup(tok);
+    CHECK((VA.data[15][0] >> 4) == 0xA, "a written PubInfo slot reads invalid (0xA)");
+    run(crcl("validate-pubkey 15", tok, sizeof tok), tok, sizeof tok, 1);
+    CHECK(ok() && !halted() && strstr(vt_captured(), "Verified: yes") && (VA.data[15][0] >> 4) == 0x5,
+          "a good token: Success, Verified: yes, slot 15 valid (0x5): %s", vt_captured());
+    CHECK(VA.nonces == 1 && VA.genkeys == 1 && VA.verifies == 1, "Nonce, GenKey digest, Verify(Validate): once each");
+
+    /* a token signed by anyone else (one signature bit), other OtherData, another nonce: Failure, slot stays invalid */
+    const int flips[] = {54 + 7, 35 + 3, 5, 33};
+    for (size_t i = 0; i < sizeof flips / sizeof flips[0]; i++) {
+        validate_setup(tok);
+        tok[flips[i]] ^= 0x01;
+        run(crcl("validate-pubkey 15", tok, sizeof tok), tok, sizeof tok, 1);
+        CHECK(failed() && !halted() && strstr(vt_captured(), "Verified: no") && (VA.data[15][0] >> 4) == 0xA,
+              "a token altered at byte %d: Failure, Verified: no, slot still invalid: %s", flips[i], vt_captured());
+    }
+
+    /* before the data lock GenKey(digest) is refused: Failure without a Verify */
+    blank_v2();
+    va_lock_config();
+    fill(tok, 118, 3);
+    run(crcl("validate-pubkey 15", tok, sizeof tok), tok, sizeof tok, 1);
+    CHECK(failed() && !halted() && VA.verifies == 0, "before the data lock: Failure, no Verify sent");
+
+    /* a slot with no PubInfo (slot 8 is K_loc staging in v2): GenKey refuses */
+    validate_setup(tok);
+    run(crcl("validate-pubkey 8", tok, sizeof tok), tok, sizeof tok, 1);
+    CHECK(failed() && VA.verifies == 0, "slot 8: Failure");
+
+    /* framing: CRC32 wrong, CRC32 missing, short payload, slot out of range -> halt before any chip call */
+    validate_setup(tok);
+    run("validate-pubkey 15 1", tok, sizeof tok, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "a wrong CRC32: halt before any chip call");
+    validate_setup(tok);
+    run("validate-pubkey 15", tok, sizeof tok, 1);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "no CRC32: halt before any chip call");
+    validate_setup(tok);
+    run(crcl("validate-pubkey 15", tok, sizeof tok), tok, 100, 0);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "a short payload: halt before any chip call");
+    validate_setup(tok);
+    run(crcl("validate-pubkey 15", tok, sizeof tok), tok, sizeof tok, 0);
+    CHECK(failed() && halted() && VA.atcab_calls == 0, "the right bytes and CRC32 but no NUL: halt before any chip call");
+    const char *bad[] = {"validate-pubkey 7 1", "validate-pubkey 16 1", "validate-pubkey 15x 1", "validate-pubkey"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        validate_setup(tok);
+        run(bad[i], tok, sizeof tok, 1);
+        CHECK(failed() && halted() && VA.atcab_calls == 0 && strstr(vt_captured(), "FRAMING ERROR (validate-pubkey arguments)"),
+              "'%s': halt on the arguments", bad[i]);
+    }
+
+    /* the chip operation refuses a slot outside 8-15 on its own, before any chip call */
+    validate_setup(tok);
+    {
+        bool v = true;
+        int err = 0;
+        CHECK(atecc_validate_pubkey_slot(7, tok, tok + 32, tok + 35, tok + 54, &v, &err) == ESP_FAIL && !v && VA.atcab_calls == 0,
+              "atecc_validate_pubkey_slot(7): refused without a chip call");
+    }
+
+    /* not initialized: the whole frame is consumed, Failure, no chip call, no halt */
+    validate_setup(tok);
+    VA_CLI_READY = false;
+    run(crcl("validate-pubkey 15", tok, sizeof tok), tok, sizeof tok, 1);
+    CHECK(failed() && !halted() && va_pending() == 0 && VA.atcab_calls == 0, "before init: Failure, frame consumed");
+    VA_CLI_READY = true;
+}
+
 int main(void)
 {
     hex2bin(TEMPLATE_V2_HEX, TEMPLATE_V2, 128);
@@ -869,6 +961,7 @@ int main(void)
     test_crc();
     test_help_probe();
     test_write_data();
+    test_validate_pubkey();
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

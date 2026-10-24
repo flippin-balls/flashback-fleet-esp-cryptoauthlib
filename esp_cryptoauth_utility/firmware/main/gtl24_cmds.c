@@ -339,6 +339,44 @@ static esp_err_t write_data_cmd(int argc, char **argv)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
+/* validate-pubkey <slot 8-15> <crc32>, then 118 raw bytes + NUL: num_in(32) || GenKey OtherData(3) || Verify OtherData(19)
+ * || signature(64) -- an offline token from device-config-management's validate_token. GTL 11c (uu5YuabE): template
+ * v2s slot 15. Framed and CRC32-bound exactly like write-pubkey; the CRC32 is required from the first version (no
+ * older host sends this command). Success only when the chip verified the token. */
+#define VALIDATE_PAYLOAD 118
+static esp_err_t validate_pubkey_cmd(int argc, char **argv)
+{
+    unsigned char p[VALIDATE_PAYLOAD];
+    int err_code = 0;
+    int slot;
+    uint32_t crc = 0;
+    bool verified = false;
+    if (argc != 3 || !parse_crc32(argv[2], &crc) || !parse_int(argv[1], 8, 15, &slot) /* validate */) {
+        ESP_LOGE(TAG, "Usage: validate-pubkey <slot 8-15> <crc32>  (then 118 raw bytes + NUL)");
+        return fail_stop("validate-pubkey arguments");
+    }
+    const bool ready = ecu_cli_atecc_ready();
+    if (!ready) {
+        ESP_LOGE(TAG, "Please initialize the device before validate-pubkey");
+    } else {
+        printf("Reading the %d-byte token...\n", VALIDATE_PAYLOAD);
+        fflush(stdout);
+    }
+    if (!consume_frame(p, sizeof p)) {
+        return fail_stop("validate-pubkey payload");
+    }
+    if (!crc32_matches(p, sizeof p, crc)) {
+        return fail_stop("validate-pubkey payload CRC32");
+    }
+    if (!ready) {
+        return finish(ESP_ERR_INVALID_STATE);
+    }
+    const esp_err_t ret = atecc_validate_pubkey_slot(slot, &p[0], &p[32], &p[35], &p[54], &verified, &err_code);
+    finish(ret);
+    printf("Verified: %s\n", verified ? "yes" : "no");
+    return ret;
+}
+
 static esp_err_t sleep_cmd(int argc, char **argv)
 {
     (void)argv;
@@ -384,6 +422,11 @@ esp_err_t register_gtl24_commands(void)
         {.command = "sleep",
          .help = "Put the ATECC to sleep; the next command runs after a wake\n  Usage: sleep",
          .func = &sleep_cmd},
+        {.command = "validate-pubkey",
+         .help = "Verify(Validate) a PubInvalid public key (slot 8-15) with an offline parent-key token, CRC32-checked "
+                 "(REQUIRED): 118 bytes num_in(32) GenKey-OtherData(3) Verify-OtherData(19) signature(64)\n"
+                 "  Usage: validate-pubkey <slot> <crc32>",
+         .func = &validate_pubkey_cmd},
     };
     esp_err_t ret = ESP_OK;
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

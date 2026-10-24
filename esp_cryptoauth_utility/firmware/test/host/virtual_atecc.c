@@ -22,6 +22,7 @@ int va_slot_size(int slot) { return slot < 8 ? 36 : (slot == 8 ? 416 : 72); }
 void va_reset(const uint8_t config[128])
 {
     memset(&VA, 0, sizeof VA);
+    VA.tk_genkey_slot = -1;
     memcpy(VA.config, config, 128);
     VA.config[86] = 0x55;   /* LockValue: data unlocked */
     VA.config[87] = 0x55;   /* LockConfig: config unlocked */
@@ -60,6 +61,9 @@ static ATCA_STATUS chip_write(int slot, size_t off, const uint8_t *d, size_t n)
     if (off >= size) { VA.refused++; return ATCA_EXECUTION_ERROR; }
     const size_t keep = (off + n > size) ? size - off : n;   /* a block write to a slot's last, partial block */
     memcpy(&VA.data[slot][off], d, keep);
+    if (slot >= 8 && off == 0 && ((kc(slot) >> 1) & 1u)) {   /* PubInfo key slot: any write invalidates (DS 4.4) */
+        VA.data[slot][0] = (uint8_t)((VA.data[slot][0] & 0x0Fu) | 0xA0u);
+    }
     if (block) VA.block_writes++; else VA.word_writes++;
     return ATCA_SUCCESS;
 }
@@ -134,6 +138,54 @@ ATCA_STATUS atcab_write_pubkey(uint16_t slot, const uint8_t *public_key)
         const ATCA_STATUS st = chip_write(slot, (size_t)b * 32u, &f[b * 32], 32);
         if (st != ATCA_SUCCESS) return st;
     }
+    return ATCA_SUCCESS;
+}
+
+ATCA_STATUS atcab_nonce(const uint8_t *num_in)
+{
+    VA.atcab_calls++;
+    wake();
+    if (num_in == NULL) return ATCA_BAD_PARAM;
+    VA.nonces++;
+    memcpy(VA.tk_numin, num_in, 32);
+    VA.tk_valid = true;
+    VA.tk_genkey_slot = -1;
+    return ATCA_SUCCESS;
+}
+
+ATCA_STATUS atcab_genkey_base(uint8_t mode, uint16_t key_id, const uint8_t *other_data, uint8_t *public_key)
+{
+    VA.atcab_calls++;
+    wake();
+    (void)public_key;
+    if (key_id > 15u || other_data == NULL) return ATCA_BAD_PARAM;
+    VA.genkeys++;
+    if (mode != GENKEY_MODE_PUBKEY_DIGEST || !data_locked() || !VA.tk_valid || !((kc(key_id) >> 1) & 1u)) {
+        VA.refused++;
+        VA.tk_valid = false;
+        return ATCA_EXECUTION_ERROR;
+    }
+    VA.tk_genkey_slot = key_id;
+    memcpy(VA.tk_genkey_other, other_data, 3);
+    return ATCA_SUCCESS;
+}
+
+ATCA_STATUS atcab_verify_validate(uint16_t key_id, const uint8_t *signature, const uint8_t *other_data, bool *is_verified)
+{
+    VA.atcab_calls++;
+    wake();
+    if (signature == NULL || other_data == NULL || is_verified == NULL || key_id > 15u) return ATCA_BAD_PARAM;
+    VA.verifies++;
+    *is_verified = false;
+    const bool tk_ok = VA.tk_valid && VA.tk_genkey_slot == (int)key_id;
+    VA.tk_valid = false;
+    VA.tk_genkey_slot = -1;
+    if (!tk_ok || write_config(key_id) != 0x1u) { VA.refused++; return ATCA_EXECUTION_ERROR; }
+    const bool match = memcmp(VA.tk_numin, VA.validate_numin, 32) == 0 && memcmp(VA.tk_genkey_other, VA.validate_genkey_other, 3) == 0 &&
+                       memcmp(other_data, VA.validate_other, 19) == 0 && memcmp(signature, VA.validate_sig, 64) == 0;
+    if (!match) return ATCA_SUCCESS;   /* calib: CHECKMAC_VERIFY_FAILED -> success, not verified */
+    VA.data[key_id][0] = (uint8_t)((VA.data[key_id][0] & 0x0Fu) | 0x50u);
+    *is_verified = true;
     return ATCA_SUCCESS;
 }
 

@@ -32,6 +32,16 @@ typedef struct {
     bool    woken;         /* atcab_wakeup() was the last chip interaction: a sleep word will be acknowledged */
     int     nacks;         /* sleep words sent to a chip that was not awake */
     int     prompts;       /* "\n>>\n" written straight to the console (the halt's; the loop's own are not modelled) */
+    /* GTL 11c Verify(Validate) (DS 4.4, 11.21), modelled without the ECC: TempKey must come from a pass-through Nonce,
+     * then GenKey PubKey-digest over the SAME slot; the token "verifies" iff num_in, both OtherData and the signature
+     * equal what the test registered as the parent's (validate_*). A verify consumes TempKey. Any write to a PubInfo
+     * slot 8-15 leaves its validity nibble (byte 0, bits 7-4) at 0xA; a verified Validate sets it to 0x5. */
+    bool    tk_valid;
+    uint8_t tk_numin[32];
+    int     tk_genkey_slot;    /* -1: no GenKey digest in TempKey */
+    uint8_t tk_genkey_other[3];
+    uint8_t validate_numin[32], validate_genkey_other[3], validate_other[19], validate_sig[64];
+    int     nonces, genkeys, verifies;
 } vatecc_t;
 
 extern vatecc_t VA;
